@@ -1,0 +1,20 @@
+# Module 1: Ingestion & Integrity
+PyExifTool==0.5.6
+ffmpeg-python==0.2.0
+
+# Module 2 & 3: CV, Preprocessing, Classical Forensics
+opencv-python==4.8.*
+facenet-pytorch==2.5.*
+Pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+jpegio==0.2.7
+
+# Module 4: Deep Learning & XAI
+timm>=0.9.0
+grad-cam==1.4.8
+
+# Module 5: UI & Reporting
+streamlit>=1.28.0
+Jinja2>=3.1.2
+WeasyPrint>=60.1
