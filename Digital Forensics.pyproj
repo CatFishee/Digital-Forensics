@@ -24,7 +24,7 @@
   <ItemGroup>
     <Compile Include="dashboard.py" />
     <Compile Include="Digital_Forensics.py" />
-    <Compile Include="src\ingestion\integrity.py" />
+    <Compile Include="src\module_1\integrity.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="requirements.txt" />
@@ -44,7 +44,7 @@
     <Folder Include="data\" />
     <Folder Include="weights\" />
     <Folder Include="src\" />
-    <Folder Include="src\ingestion\" />
+    <Folder Include="src\module_1\" />
     <Folder Include="src\classical\" />
     <Folder Include="src\deeplearning\" />
     <Folder Include="src\preprocessing\" />
