@@ -367,3 +367,17 @@ data/raw/*
 
 # Python virtual environment
 venv/
+.venv/
+env/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Thư mục kết quả chạy thử & file media test nặng
+data/processed/
+data/raw/*.mp4
+data/raw/*.avi
+data/raw/*.mov
+data/raw/*.jpg
+data/raw/*.jpeg
