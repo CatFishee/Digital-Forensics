@@ -1,6 +1,6 @@
 import streamlit as st
 import os
-from src.ingestion.integrity import calculate_hashes, extract_metadata
+from src.module_1.integrity import calculate_hashes, extract_metadata
 from PIL import Image
 
 # Cấu hình trang
