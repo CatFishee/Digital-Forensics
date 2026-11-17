@@ -15,20 +15,9 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-try:
-    from src.module_1.integrity import calculate_hashes, extract_metadata
-except ModuleNotFoundError:
-    from src.module_1.integrity import calculate_hashes, extract_metadata
-
+from src.module_1 import calculate_hashes, extract_metadata
 from src.module_2 import run_module2
-from src.module_3 import ELAAnalyzer, FFTAnalyzer
-try:
-    from src.module_3.ela_analyzer import ELAAnalyzer
-    from src.module_3.fft_analyzer import FFTAnalyzer
-except ModuleNotFoundError:
-    from ela_analyzer import ELAAnalyzer
-    from fft_analyzer import FFTAnalyzer
-
+from src.module_3 import ELAAnalyzer, FFTAnalyzer, Module3ForensicTranslator
 
 TEMP_DIR = Path("data/raw")
 PROCESSED_ROOT = Path("data/processed")
@@ -37,6 +26,7 @@ PROCESSED_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _imread_unicode(path: Path) -> np.ndarray | None:
+    """Safely read an image from disk with Unicode path support."""
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size > 0:
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -50,6 +40,7 @@ def _imread_unicode(path: Path) -> np.ndarray | None:
 
 
 def _imwrite_unicode(path: Path, image: np.ndarray) -> bool:
+    """Safely write a lossless PNG image with Unicode path support."""
     path.parent.mkdir(parents=True, exist_ok=True)
     success, encoded = cv2.imencode(".png", image)
     if not success:
@@ -59,7 +50,7 @@ def _imwrite_unicode(path: Path, image: np.ndarray) -> bool:
 
 
 def _unique_timestamped_name(parent: Path, stem: str, suffix: str = "") -> str:
-    """Create YYYY-MM-DD_HH-MM-SS_<stem><suffix>, waiting 1s only if same-second collision."""
+    """Create YYYY-MM-DD_HH-MM-SS_<stem><suffix>, waiting 1s only on same-second collision."""
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     candidate = f"{ts}_{stem}{suffix}"
     if (parent / candidate).exists():
@@ -114,6 +105,7 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
     Execute Module 3 (ELA + 2D-FFT) on unedited raw frames (frame_path).
     - ELA uses Module 2 face_bboxes purely as an in-memory coordinate mask.
     - 2D-FFT runs on the full raw frame AND unwarped raw face bbox crops (no affine warping).
+    - Deterministic rule-based plain-English interpretations are attached to each record.
     """
     manifest_dir = _get_manifest_dir(m2_res)
     ela_dir = manifest_dir / "ela"
@@ -124,10 +116,10 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
 
     ela_analyzer = ELAAnalyzer(quality=ela_quality)
     fft_analyzer = FFTAnalyzer()
+    translator = Module3ForensicTranslator()
 
     frames_detail = m2_res.get("frames_detail", [])
     frame_results: list[dict] = []
-    frame_record_paths: dict[int, str] = {}
     used_names: set[str] = set()
 
     for idx, frame_rec in enumerate(frames_detail):
@@ -228,12 +220,12 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
             },
             "record_json_path": str(rec_path.resolve()),
         }
+        frame_m3_record["interpretation"] = translator.interpret_frame(frame_m3_record)
 
         rec_path.write_text(
             json.dumps(frame_m3_record, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        frame_record_paths[idx] = str(rec_path.resolve())
         frame_results.append(frame_m3_record)
 
     ela_scores = [r["summary"]["ela_score"] for r in frame_results]
@@ -278,12 +270,48 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
         },
         "frames_detail": frame_results,
     }
+    m3_manifest["interpretation"] = translator.interpret_manifest(m3_manifest)
 
     m3_manifest_path.write_text(
         json.dumps(m3_manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return m3_manifest
+
+
+def _render_translation_block(
+    translation: dict | None,
+    title: str = "Plain-English Forensic Interpretation",
+) -> None:
+    """Render deterministic rule-based forensic explanations for non-expert users."""
+    if not translation:
+        return
+
+    st.markdown(f"###### 💡 {title}")
+    sev = str(translation.get("severity", "low")).lower()
+    headline = translation.get("headline", "")
+    if sev == "high":
+        st.error(f"**Summary:** {headline}")
+    elif sev == "medium":
+        st.warning(f"**Summary:** {headline}")
+    else:
+        st.success(f"**Summary:** {headline}")
+
+    for item in translation.get("findings", []):
+        item_sev = item.get("severity", "info")
+        text = f"**{item.get('title', 'Finding')}:** {item.get('detail', '')}"
+        if item_sev == "alert":
+            st.error(text)
+        elif item_sev == "warning":
+            st.warning(text)
+        elif item_sev == "ok":
+            st.success(text)
+        else:
+            st.info(text)
+
+    guidance = translation.get("user_guidance")
+    if guidance:
+        st.caption(f"ℹ️ {guidance}")
 
 
 def _render_frame_forensic_record(
@@ -446,8 +474,8 @@ def _render_frame_forensic_record(
                 st.table({"Landmark": lm_names, "X": lm_x, "Y": lm_y})
 
 
-def _render_module3_ela(ela_res: dict) -> None:
-    """Render parsed Module 3.1 ELA analysis & images."""
+def _render_module3_ela(ela_res: dict, ela_translation: dict | None = None) -> None:
+    """Render parsed Module 3.1 ELA analysis, images, and deterministic findings."""
     st.markdown("##### 🔥 Error Level Analysis (ELA) on Raw Frame")
     if ela_res.get("is_jpeg"):
         st.success(ela_res.get("note", ""))
@@ -464,11 +492,17 @@ def _render_module3_ela(ela_res: dict) -> None:
         if heat_p and os.path.exists(heat_p):
             st.image(heat_p, caption="ELA Error Heatmap (Inferno)", use_container_width=True)
 
+    _render_translation_block(
+        ela_translation,
+        title="Plain-English ELA Interpretation",
+    )
+
     metrics = ela_res.get("metrics", {})
     face_mean = metrics.get("face_region_mean")
     bg_mean = metrics.get("bg_region_mean")
     contrast = metrics.get("face_bg_contrast")
 
+    st.markdown("###### 📊 Quantitative ELA Metrics")
     st.table(
         {
             "ELA Metric": [
@@ -505,6 +539,12 @@ def _render_module3_fft(frame_m3: dict) -> None:
     """Render parsed Module 3.2 2D-FFT (Full Frame & Unwarped Raw Face BBox Crops)."""
     full_fft = frame_m3["fft_full_frame"]
     face_ffts = frame_m3.get("fft_unwarped_faces", [])
+    fft_translation = frame_m3.get("interpretation", {}).get("fft")
+
+    _render_translation_block(
+        fft_translation,
+        title="Plain-English 2D-FFT Interpretation",
+    )
 
     st.markdown("##### 📡 Full Raw Frame 2D-FFT Spectrum")
     c1, c2 = st.columns(2)
@@ -601,8 +641,23 @@ def _render_module3_fft(frame_m3: dict) -> None:
 
 
 def _render_module3_frame_record(frame_m3: dict) -> None:
-    """Render parsed Module 3 frame-level summary record without raw JSON."""
+    """Render parsed Module 3 frame-level summary record and plain-English takeaways without raw JSON."""
     st.markdown("##### 📄 Frame-Level Module 3 Forensic Record")
+
+    interp = frame_m3.get("interpretation", {})
+    if interp:
+        sev = str(interp.get("severity", "low")).lower()
+        headline = interp.get("headline", "")
+        if sev == "high":
+            st.error(f"**Frame Conclusion:** {headline}")
+        elif sev == "medium":
+            st.warning(f"**Frame Conclusion:** {headline}")
+        else:
+            st.success(f"**Frame Conclusion:** {headline}")
+
+        for takeaway in interp.get("key_takeaways", []):
+            st.info(takeaway)
+
     s = frame_m3["summary"]
     st.table(
         {
@@ -731,6 +786,7 @@ sel_ela_quality = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
+# Lock / Unlock button to control forensic pipeline execution
 if not is_locked:
     if st.sidebar.button(
         "🔒 Apply Settings (Lock)", use_container_width=True, type="primary"
@@ -749,6 +805,7 @@ else:
     st.sidebar.success("🔒 Configuration is LOCKED for evidence integrity.")
     if st.sidebar.button("🔓 Unlock & Edit Settings", use_container_width=True):
         st.session_state["settings_locked"] = False
+        # Clear cached results so the user can edit parameters
         st.session_state["m2_result"] = None
         st.session_state["m3_result"] = None
         st.session_state.pop("m2_cache_key", None)
@@ -846,6 +903,7 @@ if uploaded_file is not None:
             f"{active_cfg['output_size']}_{active_cfg['max_frames']}_{active_cfg['ela_quality']}"
         )
 
+        # Execute Module 2 & Module 3 only when locked and not yet cached
         if st.session_state.get("m2_cache_key") != cache_key:
             with st.spinner(
                 f"Executing Module 2 ({active_cfg['detector_backend'].upper()}) & Module 3 (ELA + 2D-FFT on raw frames)..."
@@ -1076,6 +1134,11 @@ if uploaded_file is not None:
                 mk4.metric("Max Combined Score", f"{m3_sum['max_module3_score']:.3f}")
                 mk5.metric("Module 3 Suspicion", str(m3_sum["overall_suspicion"]).upper())
 
+                _render_translation_block(
+                    m3_res.get("interpretation"),
+                    title="Overall Module 3 Plain-English Takeaways",
+                )
+
                 total_m3_frames = len(m3_res["frames_detail"])
                 if total_m3_frames > 0:
                     st.markdown("---")
@@ -1132,7 +1195,10 @@ if uploaded_file is not None:
                     )
 
                     if m3_mode == m3_modes[0]:
-                        _render_module3_ela(current_m3["ela"])
+                        _render_module3_ela(
+                            current_m3["ela"],
+                            ela_translation=current_m3.get("interpretation", {}).get("ela"),
+                        )
                     elif m3_mode == m3_modes[1]:
                         _render_module3_fft(current_m3)
                     elif m3_mode == m3_modes[2]:
