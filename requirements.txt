@@ -1,21 +1,44 @@
-# Module 1: Ingestion & Integrity
+# ==============================================================================
+# DEEPFAKE FORENSIC TOOLKIT - REQUIREMENTS
+# Đã chuẩn hóa tương thích Python 3.10 - 3.12 & NumPy 2.x
+# ==============================================================================
+
+# --- Core / Deep Learning Runtime (Dùng chung Module 2 & 4) ---
+# Lưu ý: Nếu dùng GPU NVIDIA (CUDA), cài torch/torchvision theo lệnh trên pytorch.org trước
+torch>=2.3.0
+torchvision>=0.18.0
+numpy>=2.0.0,<3.0.0
+Pillow>=10.3.0
+PyYAML>=6.0.1
+tqdm>=4.66.0
+
+# --- Module 1: Ingestion, Chain of Custody & File Forensics (EXIF, DQT) ---
 PyExifTool==0.5.6
+pyjpegio>=0.2.0
 ffmpeg-python==0.2.0
 
-# Module 2 & 3: CV, Preprocessing, Classical Forensics
-opencv-python==4.8.*
-facenet-pytorch==2.5.*
-Pillow>=10.0.0
-numpy>=1.24.0
-scipy>=1.11.0
-pyjpegio
+# --- Module 2: Face Localization & Affine Alignment ---
+# Dùng >=4.11.0 để tương thích hoàn toàn với NumPy 2.x (tránh lỗi _ARRAY_API)
+opencv-python>=4.11.0
+# Mặc định dùng RetinaFace qua UniFace (nếu dùng GPU ONNX đổi thành uniface[gpu])
+uniface[cpu]>=2.0.0
 
-# Module 4: Deep Learning & XAI
-timm>=0.9.0
-grad-cam==1.4.8
+# --- Module 3: Pixel-level Forensics (ELA & 2D-FFT) ---
+scipy>=1.14.0
+scikit-image>=0.25.0
 
-# Module 5: UI & Reporting
-streamlit>=1.28.0
-Jinja2>=3.1.2
-WeasyPrint>=60.1
-uniface[cpu]
+# --- Module 4: Deep Learning (DeepfakeBench: Xception, SBI, F3Net) & XAI ---
+timm>=1.0.0
+efficientnet-pytorch>=0.7.1
+grad-cam>=1.5.5
+scikit-learn>=1.5.0
+
+# --- Module 5: Decision Fusion, Dashboard UI & PDF Forensic Report ---
+streamlit>=1.38.0
+matplotlib>=3.9.0
+Jinja2>=3.1.4
+WeasyPrint>=62.0
+
+# --- Tùy chọn (Không đưa trực tiếp vào luồng cài chính để tránh xung đột) ---
+# Nếu bắt buộc dùng backend MTCNN trong face_aligner.py, cài riêng bằng:
+# pip install facenet-pytorch==2.6.0 --no-deps

@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-# Tọa độ chuẩn (Canonical Pose) của 5 facial landmarks trên khung 112x112
-# Thứ tự chuẩn: [left_eye, right_eye, nose, mouth_left, mouth_right]
+# Canonical pose coordinates for 5 facial landmarks on a 112x112 reference grid
+# Order: [left_eye, right_eye, nose, mouth_left, mouth_right]
 CANONICAL_LANDMARKS_112 = np.array(
     [
         [38.2946, 51.6963],
@@ -20,7 +20,7 @@ CANONICAL_LANDMARKS_112 = np.array(
 
 
 def _imread_unicode(path: Path) -> Optional[np.ndarray]:
-    """Đọc ảnh an toàn trên Windows (có dự phòng Pillow)."""
+    """Safely read an image with Unicode path support (with Pillow fallback)."""
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size > 0:
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -34,7 +34,7 @@ def _imread_unicode(path: Path) -> Optional[np.ndarray]:
 
 
 def _imwrite_unicode(path: Path, image: np.ndarray) -> bool:
-    """Lưu ảnh PNG không nén an toàn trên Windows."""
+    """Safely save a lossless PNG image with Unicode path support."""
     path.parent.mkdir(parents=True, exist_ok=True)
     success, encoded = cv2.imencode(".png", image)
     if not success:
@@ -47,9 +47,9 @@ def _is_valid_face_geometry(
     box: np.ndarray, pts: np.ndarray, min_face_size: int
 ) -> bool:
     """
-    Bộ lọc hình học (Sanity Check) loại bỏ False Positive:
-    - Kích thước khuôn mặt tối thiểu đủ lớn để phân tích pháp chứng.
-    - Cấu trúc 5 điểm mốc hợp lý (mắt trái < mắt phải, mũi dưới mắt, miệng dưới mũi).
+    Geometric sanity check to filter out false positives:
+    - Enforces minimum face bounding box dimensions for forensic analysis.
+    - Validates anatomical ordering of the 5 facial landmarks.
     """
     x1, y1, x2, y2 = box[:4]
     w = float(x2 - x1)
@@ -62,7 +62,6 @@ def _is_valid_face_geometry(
         return False
 
     left_eye, right_eye, nose, mouth_left, mouth_right = pts
-    # Khoảng cách giữa 2 mắt phải dương và hợp lý so với chiều rộng khung mặt
     eye_dx = float(right_eye[0] - left_eye[0])
     if eye_dx <= 0.15 * w:
         return False
@@ -70,7 +69,7 @@ def _is_valid_face_geometry(
     eyes_mid_y = 0.5 * (float(left_eye[1]) + float(right_eye[1]))
     mouth_mid_y = 0.5 * (float(mouth_left[1]) + float(mouth_right[1]))
 
-    # Mũi phải nằm dưới trục mắt và phía trên (hoặc ngang) trục miệng
+    # Nose must lie vertically between eye line and mouth line
     if not (eyes_mid_y < float(nose[1]) < mouth_mid_y):
         return False
 
@@ -116,7 +115,7 @@ class FaceAligner:
                 device=self.device,
             )
         else:
-            raise ValueError(f"Backend không hỗ trợ: {backend}. Chọn 'retinaface' hoặc 'mtcnn'.")
+            raise ValueError(f"Unsupported backend: {backend}. Choose 'retinaface' or 'mtcnn'.")
 
     def _detect(self, img_bgr: np.ndarray) -> List[Tuple[np.ndarray, float, np.ndarray]]:
         detections: List[Tuple[np.ndarray, float, np.ndarray]] = []
@@ -182,7 +181,7 @@ class FaceAligner:
         src = Path(frame_path)
         img_bgr = _imread_unicode(src)
         if img_bgr is None:
-            raise ValueError(f"Không thể đọc ảnh khung hình: {src}")
+            raise ValueError(f"Unable to read frame image: {src}")
 
         detections = self._detect(img_bgr)
         faces_result: List[Dict[str, Any]] = []
