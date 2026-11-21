@@ -17,7 +17,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.module_1 import calculate_hashes, extract_metadata
 from src.module_2 import run_module2
-from src.module_3 import ELAAnalyzer, FFTAnalyzer, Module3ForensicTranslator
+from src.module_3 import (
+    ELAAnalyzer,
+    FFTAnalyzer,
+    Module3ForensicTranslator,
+    NoiseAnalyzer,
+)
 
 TEMP_DIR = Path("data/raw")
 PROCESSED_ROOT = Path("data/processed")
@@ -102,18 +107,21 @@ def _save_module2_json_records(m2_res: dict) -> dict[int, str]:
 
 def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
     """
-    Execute Module 3 (ELA + 2D-FFT) on unedited raw frames (frame_path).
-    - ELA uses Module 2 face_bboxes purely as an in-memory coordinate mask.
-    - 2D-FFT runs on the full raw frame AND unwarped raw face bbox crops (no affine warping).
-    - Deterministic rule-based plain-English interpretations are attached to each record.
+    Execute Upgraded Module 3 on unedited raw frames (frame_path):
+      1. NoiseAnalyzer (SRM residuals + face/background contrast + blending seam) — Video & Image.
+      2. FFTAnalyzer (1/f decay + chroma FFT + periodic spikes, full frame + unwarped face crops).
+      3. ELAAnalyzer — Included in score ONLY for native JPEG images (excluded for video PNGs).
     """
     manifest_dir = _get_manifest_dir(m2_res)
+    noise_dir = manifest_dir / "noise"
     ela_dir = manifest_dir / "ela"
     fft_dir = manifest_dir / "fft"
     fft_crops_dir = fft_dir / "raw_crops"
+    noise_dir.mkdir(parents=True, exist_ok=True)
     ela_dir.mkdir(parents=True, exist_ok=True)
     fft_dir.mkdir(parents=True, exist_ok=True)
 
+    noise_analyzer = NoiseAnalyzer()
     ela_analyzer = ELAAnalyzer(quality=ela_quality)
     fft_analyzer = FFTAnalyzer()
     translator = Module3ForensicTranslator()
@@ -128,7 +136,15 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
         faces = frame_rec.get("faces", []) or []
         face_bboxes = [f["bbox"] for f in faces if "bbox" in f]
 
-        # 1. ELA on raw frame with Module 2 face_bboxes mask
+        # 1. SRM Noise Residual & Boundary Blending Analysis (primary spatial check)
+        noise_res = noise_analyzer.analyze(
+            image_path=frame_path,
+            output_dir=str(noise_dir),
+            face_bboxes=face_bboxes if face_bboxes else None,
+            prefix=frame_stem,
+        )
+
+        # 2. ELA on raw frame (scored ONLY when source is native JPEG)
         ela_res = ela_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(ela_dir),
@@ -136,15 +152,16 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
             prefix=frame_stem,
         )
 
-        # 2. Full-frame 2D-FFT on raw frame
+        # 3. Full-frame Upgraded 2D-FFT (auto-trims solid white/black outer margins)
         full_fft_res = fft_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(fft_dir),
             prefix=f"{frame_stem}_frame",
             save_radial_plot=True,
+            trim_borders=True,
         )
 
-        # 3. Unwarped raw face bbox 2D-FFT (direct pixel slice, zero affine interpolation)
+        # 4. Unwarped raw face bbox 2D-FFT (direct pixel slice, zero affine distortion)
         face_raw_ffts: list[dict] = []
         if faces:
             raw_bgr = _imread_unicode(Path(frame_path))
@@ -170,6 +187,7 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
                             output_dir=str(fft_dir),
                             prefix=f"{frame_stem}_face_{face_idx:02d}",
                             save_radial_plot=True,
+                            trim_borders=False,
                         )
                         face_raw_ffts.append(
                             {
@@ -192,8 +210,16 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
             if max_face_fft is not None
             else full_fft_res["fft_score"]
         )
+
+        # Peak-weighted fusion across active signals (ELA included ONLY for native JPEG)
+        active_scores = [noise_res["noise_score"], effective_fft_score]
+        ela_used = bool(ela_res.get("is_jpeg", False))
+        if ela_used:
+            active_scores.append(ela_res["ela_score"])
+
         combined_m3_score = round(
-            0.5 * ela_res["ela_score"] + 0.5 * effective_fft_score, 4
+            float(0.60 * max(active_scores) + 0.40 * float(np.mean(active_scores))),
+            4,
         )
 
         rec_name = f"{frame_stem}_module3_record.json"
@@ -205,18 +231,22 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
         frame_m3_record = {
             "frame_index": idx + 1,
             "frame_path": frame_path,
+            "noise": noise_res,
             "ela": ela_res,
             "fft_full_frame": full_fft_res,
             "fft_unwarped_faces": face_raw_ffts,
             "summary": {
+                "noise_score": noise_res["noise_score"],
+                "noise_suspicion": noise_res["suspicion_level"],
                 "ela_score": ela_res["ela_score"],
                 "ela_suspicion": ela_res["suspicion_level"],
+                "ela_used_in_score": ela_used,
                 "frame_fft_score": full_fft_res["fft_score"],
                 "max_face_fft_score": max_face_fft,
                 "effective_fft_score": effective_fft_score,
                 "fft_suspicion": FFTAnalyzer._compute_suspicion_level(effective_fft_score),
                 "combined_module3_score": combined_m3_score,
-                "combined_suspicion": ELAAnalyzer._compute_suspicion_level(combined_m3_score),
+                "combined_suspicion": NoiseAnalyzer._compute_suspicion_level(combined_m3_score),
             },
             "record_json_path": str(rec_path.resolve()),
         }
@@ -228,10 +258,14 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
         )
         frame_results.append(frame_m3_record)
 
+    noise_scores = [r["summary"]["noise_score"] for r in frame_results]
     ela_scores = [r["summary"]["ela_score"] for r in frame_results]
     fft_scores = [r["summary"]["effective_fft_score"] for r in frame_results]
     combined_scores = [r["summary"]["combined_module3_score"] for r in frame_results]
+    any_ela_used = any(r["summary"]["ela_used_in_score"] for r in frame_results)
 
+    mean_noise = round(float(np.mean(noise_scores)), 4) if noise_scores else 0.0
+    max_noise = round(float(np.max(noise_scores)), 4) if noise_scores else 0.0
     mean_ela = round(float(np.mean(ela_scores)), 4) if ela_scores else 0.0
     max_ela = round(float(np.max(ela_scores)), 4) if ela_scores else 0.0
     mean_fft = round(float(np.mean(fft_scores)), 4) if fft_scores else 0.0
@@ -248,22 +282,31 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
         },
         "module3_settings": {
             "input_source": "Unedited Raw Frames (frame_path)",
+            "active_signals": (
+                ["Noise & Boundary (SRM)", "Upgraded 2D-FFT (1/f + Chroma)", "JPEG ELA"]
+                if any_ela_used
+                else ["Noise & Boundary (SRM)", "Upgraded 2D-FFT (1/f + Chroma)"]
+            ),
             "ela_quality": ela_quality,
-            "ela_face_bbox_mask": True,
-            "fft_modes": ["Full Raw Frame", "Unwarped Raw Face BBox Crop"],
+            "ela_scored_on_native_jpeg_only": True,
+            "fft_modes": ["Unwarped Raw Face BBox Crop", "Full Raw Frame"],
         },
         "execution_summary": {
             "frames_analyzed": len(frame_results),
+            "mean_noise_score": mean_noise,
+            "max_noise_score": max_noise,
             "mean_ela_score": mean_ela,
             "max_ela_score": max_ela,
+            "ela_used_in_scoring": any_ela_used,
             "mean_fft_score": mean_fft,
             "max_fft_score": max_fft,
             "mean_module3_score": mean_comb,
             "max_module3_score": max_comb,
-            "overall_suspicion": ELAAnalyzer._compute_suspicion_level(max_comb),
+            "overall_suspicion": NoiseAnalyzer._compute_suspicion_level(max_comb),
         },
         "artifacts_directory": {
             "root": str(manifest_dir.resolve()),
+            "noise": str(noise_dir.resolve()),
             "ela": str(ela_dir.resolve()),
             "fft": str(fft_dir.resolve()),
             "manifest": str(m3_manifest_path.resolve()),
@@ -279,39 +322,80 @@ def _run_module3_on_raw_frames(m2_res: dict, ela_quality: int = 90) -> dict:
     return m3_manifest
 
 
-def _render_translation_block(
-    translation: dict | None,
-    title: str = "Plain-English Forensic Interpretation",
+def _suspicion_display(severity: str, score: float | None = None) -> tuple[str, str, str]:
+    """Return (label, icon, css_class) for a given suspicion severity."""
+    sev = str(severity).lower()
+    pct_str = f" ({float(score) * 100:.0f}%)" if score is not None else ""
+    if sev == "high":
+        return f"HIGH{pct_str}", "🔴", "status-high"
+    if sev == "medium":
+        return f"MODERATE{pct_str}", "🟡", "status-medium"
+    return f"LOW{pct_str}", "🟢", "status-low"
+
+
+def _render_suspicion_box(
+    title: str,
+    severity: str,
+    score: float | None = None,
+    subtitle: str | None = None,
 ) -> None:
-    """Render deterministic rule-based forensic explanations for non-expert users."""
+    """Render a high-visibility colored quick-glance status box."""
+    label, icon, css_cls = _suspicion_display(severity, score)
+    sub_html = f'<div class="status-sub">{subtitle}</div>' if subtitle else ""
+    st.markdown(
+        f"""
+        <div class="status-banner {css_cls}">
+            <div class="status-title">{icon} {title}: <span>{label}</span></div>
+            {sub_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_verdict_and_details(
+    translation: dict | None,
+    verdict_title: str = "Verdict",
+    expander_label: str = "📖 Click to expand detailed plain-English explanation",
+) -> None:
+    """
+    Show a short, colored verdict box first, followed by a collapsed expander
+    containing simple plain-English details for non-technical users.
+    """
     if not translation:
         return
 
-    st.markdown(f"###### 💡 {title}")
     sev = str(translation.get("severity", "low")).lower()
     headline = translation.get("headline", "")
+
     if sev == "high":
-        st.error(f"**Summary:** {headline}")
+        st.error(f"**{verdict_title}:** {headline}")
     elif sev == "medium":
-        st.warning(f"**Summary:** {headline}")
+        st.warning(f"**{verdict_title}:** {headline}")
     else:
-        st.success(f"**Summary:** {headline}")
+        st.success(f"**{verdict_title}:** {headline}")
 
-    for item in translation.get("findings", []):
-        item_sev = item.get("severity", "info")
-        text = f"**{item.get('title', 'Finding')}:** {item.get('detail', '')}"
-        if item_sev == "alert":
-            st.error(text)
-        elif item_sev == "warning":
-            st.warning(text)
-        elif item_sev == "ok":
-            st.success(text)
-        else:
-            st.info(text)
-
+    findings = translation.get("findings", []) or []
     guidance = translation.get("user_guidance")
-    if guidance:
-        st.caption(f"ℹ️ {guidance}")
+    if not findings and not guidance:
+        return
+
+    icon_map = {
+        "alert": "🔴",
+        "warning": "⚠️",
+        "ok": "✅",
+        "info": "ℹ️",
+    }
+
+    with st.expander(expander_label, expanded=False):
+        for item in findings:
+            item_icon = icon_map.get(item.get("severity", "info"), "ℹ️")
+            st.markdown(
+                f"{item_icon} **{item.get('title', 'Finding')}:** {item.get('detail', '')}"
+            )
+        if guidance:
+            st.markdown("---")
+            st.caption(f"💡 {guidance}")
 
 
 def _render_frame_forensic_record(
@@ -474,27 +558,104 @@ def _render_frame_forensic_record(
                 st.table({"Landmark": lm_names, "X": lm_x, "Y": lm_y})
 
 
+def _render_module3_noise(noise_res: dict, noise_translation: dict | None = None) -> None:
+    """Render Module 3.1 Noise & Boundary Analysis: Visuals -> Verdict -> Details -> Tucked Metrics."""
+    st.markdown("##### 🔬 SRM Noise Residual & Face-Boundary Analysis")
+    st.caption(
+        "Works on both video frames and images. Strips away colors and lighting to expose unnatural "
+        "smoothness, mismatched sensor grain, or face-swap blending seams."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        res_p = noise_res.get("noise_residual_path")
+        if res_p and os.path.exists(res_p):
+            st.image(res_p, caption="High-Pass Pixel Grain (SRM Residual)", use_container_width=True)
+    with c2:
+        heat_p = noise_res.get("noise_heatmap_path")
+        if heat_p and os.path.exists(heat_p):
+            st.image(
+                heat_p,
+                caption="Local Noise Variance Heatmap (Blue = Smooth, Yellow/Red = High Grain)",
+                use_container_width=True,
+            )
+
+    st.write("")
+
+    _render_verdict_and_details(
+        noise_translation,
+        verdict_title="Noise & Boundary Verdict",
+        expander_label="📖 Detailed Plain-English Noise Explanation",
+    )
+
+    m = noise_res.get("metrics", {}) or {}
+    with st.expander("📊 Technical Noise & Boundary Metrics (For Forensic Reviewers)", expanded=False):
+        st.table(
+            {
+                "Noise / Boundary Metric": [
+                    "Noise Suspicion Score",
+                    "Suspicion Level",
+                    "Noise P95 / P50 Ratio",
+                    "Block Noise CV",
+                    "Global Noise Median",
+                    "Face Noise Median",
+                    "Background Noise Median",
+                    "Face-vs-Background Noise Contrast",
+                    "Face Smoother Than Background",
+                    "Face / BG Chrominance Noise",
+                    "Face-vs-BG Chroma Contrast",
+                    "Boundary Seam Transition Ratio",
+                ],
+                "Observed Value": [
+                    f"{noise_res['noise_score']:.4f} ({noise_res['noise_score'] * 100:.0f}%)",
+                    str(noise_res["suspicion_level"]).upper(),
+                    str(m.get("noise_p95_p50_ratio")),
+                    str(m.get("noise_block_cv")),
+                    str(m.get("global_noise_median")),
+                    str(m.get("face_noise_median")) if m.get("face_noise_median") is not None else "N/A",
+                    str(m.get("bg_noise_median")) if m.get("bg_noise_median") is not None else "N/A",
+                    str(m.get("face_bg_noise_contrast")) if m.get("face_bg_noise_contrast") is not None else "N/A",
+                    str(m.get("face_smoother_than_bg")) if m.get("face_smoother_than_bg") is not None else "N/A",
+                    f"{m.get('face_chroma_noise')} / {m.get('bg_chroma_noise')}"
+                    if m.get("face_chroma_noise") is not None
+                    else "N/A",
+                    str(m.get("face_bg_chroma_contrast")) if m.get("face_bg_chroma_contrast") is not None else "N/A",
+                    str(m.get("boundary_seam_ratio")) if m.get("boundary_seam_ratio") is not None else "N/A",
+                ],
+            }
+        )
+
+
 def _render_module3_ela(ela_res: dict, ela_translation: dict | None = None) -> None:
-    """Render parsed Module 3.1 ELA analysis, images, and deterministic findings."""
-    st.markdown("##### 🔥 Error Level Analysis (ELA) on Raw Frame")
-    if ela_res.get("is_jpeg"):
-        st.success(ela_res.get("note", ""))
+    """Render Module 3.3 ELA (scored only for native JPEG): Visuals -> Verdict -> Details -> Tucked Metrics."""
+    st.markdown("##### 🔥 Error Level Analysis (ELA — Native JPEG Specialist)")
+    if not ela_res.get("is_jpeg"):
+        st.info(
+            f"ℹ️ This frame is **{ela_res.get('original_format', 'PNG')}** (not a native JPEG photo). "
+            "ELA visuals are shown for reference, **excluded from Module 3 suspicion scoring** so video frames are not diluted."
+        )
     else:
-        st.warning(ela_res.get("note", ""))
+        st.caption(
+            "Re-saves the JPEG to highlight areas that react differently to compression. "
+            "Brighter pixels indicate larger changes."
+        )
 
     c1, c2 = st.columns(2)
     with c1:
         raw_p = ela_res.get("ela_raw_path")
         if raw_p and os.path.exists(raw_p):
-            st.image(raw_p, caption="Amplified ELA Residual (RGB)", use_container_width=True)
+            st.image(raw_p, caption="Amplified Compression Differences (RGB)", use_container_width=True)
     with c2:
         heat_p = ela_res.get("ela_heatmap_path")
         if heat_p and os.path.exists(heat_p):
-            st.image(heat_p, caption="ELA Error Heatmap (Inferno)", use_container_width=True)
+            st.image(heat_p, caption="Compression Heatmap (Brighter = Higher Difference)", use_container_width=True)
 
-    _render_translation_block(
+    st.write("")
+
+    _render_verdict_and_details(
         ela_translation,
-        title="Plain-English ELA Interpretation",
+        verdict_title="ELA Verdict",
+        expander_label="📖 Detailed Plain-English ELA Explanation",
     )
 
     metrics = ela_res.get("metrics", {})
@@ -502,187 +663,229 @@ def _render_module3_ela(ela_res: dict, ela_translation: dict | None = None) -> N
     bg_mean = metrics.get("bg_region_mean")
     contrast = metrics.get("face_bg_contrast")
 
-    st.markdown("###### 📊 Quantitative ELA Metrics")
-    st.table(
-        {
-            "ELA Metric": [
-                "ELA Suspicion Score",
-                "Suspicion Level",
-                "Original Format",
-                "Re-compression Quality",
-                "Mean / Std / Max Error",
-                "Block P95 / P50 Ratio",
-                "Block Coefficient of Variation (CV)",
-                "Hotspot Pixel Ratio",
-                "Face Region Mean Error",
-                "Background Region Mean Error",
-                "Face-vs-Background Contrast",
-            ],
-            "Observed Value": [
-                f"{ela_res['ela_score']:.4f}",
-                str(ela_res["suspicion_level"]).upper(),
-                str(ela_res.get("original_format", "N/A")),
-                f"JPEG Q={ela_res.get('ela_quality', 90)}",
-                f"{metrics.get('mean_error')} / {metrics.get('std_error')} / {metrics.get('max_error')}",
-                str(metrics.get("block_p95_p50_ratio")),
-                str(metrics.get("block_cv")),
-                str(metrics.get("hotspot_ratio")),
-                str(face_mean) if face_mean is not None else "N/A (No face bbox)",
-                str(bg_mean) if bg_mean is not None else "N/A (No face bbox)",
-                str(contrast) if contrast is not None else "N/A (No face bbox)",
-            ],
-        }
-    )
+    with st.expander("📊 Technical ELA Metrics (For Forensic Reviewers)", expanded=False):
+        st.caption(ela_res.get("note", ""))
+        st.table(
+            {
+                "ELA Metric": [
+                    "ELA Suspicion Score",
+                    "Included in Module 3 Score",
+                    "Original Format",
+                    "Re-compression Quality",
+                    "Mean / Std / Max Error",
+                    "Block P95 / P50 Ratio",
+                    "Block Coefficient of Variation (CV)",
+                    "Hotspot Pixel Ratio",
+                    "Face Region Mean Error",
+                    "Background Region Mean Error",
+                    "Face-vs-Background Contrast",
+                ],
+                "Observed Value": [
+                    f"{ela_res['ela_score']:.4f} ({ela_res['ela_score'] * 100:.0f}%)",
+                    "Yes (Native JPEG)" if ela_res.get("is_jpeg") else "No (Excluded for Non-JPEG/Video)",
+                    str(ela_res.get("original_format", "N/A")),
+                    f"JPEG Q={ela_res.get('ela_quality', 90)}",
+                    f"{metrics.get('mean_error')} / {metrics.get('std_error')} / {metrics.get('max_error')}",
+                    str(metrics.get("block_p95_p50_ratio")),
+                    str(metrics.get("block_cv")),
+                    str(metrics.get("hotspot_ratio")),
+                    str(face_mean) if face_mean is not None else "N/A (No face bbox)",
+                    str(bg_mean) if bg_mean is not None else "N/A (No face bbox)",
+                    str(contrast) if contrast is not None else "N/A (No face bbox)",
+                ],
+            }
+        )
 
 
 def _render_module3_fft(frame_m3: dict) -> None:
-    """Render parsed Module 3.2 2D-FFT (Full Frame & Unwarped Raw Face BBox Crops)."""
+    """Render Module 3.2 Upgraded 2D-FFT: Unwarped Face Crops First -> Full Frame -> Verdict -> Details -> Tucked Metrics."""
     full_fft = frame_m3["fft_full_frame"]
     face_ffts = frame_m3.get("fft_unwarped_faces", [])
     fft_translation = frame_m3.get("interpretation", {}).get("fft")
 
-    _render_translation_block(
-        fft_translation,
-        title="Plain-English 2D-FFT Interpretation",
+    # 1A. Unwarped Face Crops First
+    st.markdown("##### 🎯 Unwarped Face Region Frequency Scan (Primary Check)")
+    st.caption(
+        "Scans each detected face directly from the raw image (without stretching or warping) "
+        "for repeating AI grid traces, chrominance anomalies, and 1/f detail curve deviations."
     )
 
-    st.markdown("##### 📡 Full Raw Frame 2D-FFT Spectrum")
+    if not face_ffts:
+        st.info(
+            "No valid face regions (>= 32x32 px) were detected in this frame; see the full-frame scan below."
+        )
+    else:
+        for f_fft in face_ffts:
+            label, icon, _ = _suspicion_display(
+                f_fft["suspicion_level"], f_fft["fft_score"]
+            )
+            with st.container(border=True):
+                st.markdown(
+                    f"**{f_fft['global_face_id']}** — Frequency Suspicion: {icon} `{label}`"
+                )
+                col_crop, col_spec, col_rad = st.columns([0.8, 1.1, 1.1])
+                with col_crop:
+                    if os.path.exists(f_fft["raw_crop_path"]):
+                        st.image(
+                            f_fft["raw_crop_path"],
+                            caption=f"Raw Face Slice ({f_fft['image_resolution'][0]}x{f_fft['image_resolution'][1]} px)",
+                            use_container_width=True,
+                        )
+                with col_spec:
+                    if f_fft.get("fft_spectrum_path") and os.path.exists(f_fft["fft_spectrum_path"]):
+                        st.image(
+                            f_fft["fft_spectrum_path"],
+                            caption="Face Frequency Pattern (2D-FFT)",
+                            use_container_width=True,
+                        )
+                with col_rad:
+                    if f_fft.get("fft_radial_plot_path") and os.path.exists(f_fft["fft_radial_plot_path"]):
+                        st.image(
+                            f_fft["fft_radial_plot_path"],
+                            caption="Face Detail Drop-Off vs. 1/f Camera Trend",
+                            use_container_width=True,
+                        )
+
+    # 1B. Full Raw Frame 2D-FFT Second
+    st.markdown("##### 📡 Full Frame Frequency Scan (Border-Trimmed)")
     c1, c2 = st.columns(2)
     with c1:
         spec_p = full_fft.get("fft_spectrum_path")
         if spec_p and os.path.exists(spec_p):
-            st.image(spec_p, caption="2D-FFT Log Magnitude Spectrum (Full Frame)", use_container_width=True)
+            st.image(spec_p, caption="Full-Frame Frequency Pattern (2D-FFT)", use_container_width=True)
     with c2:
         rad_p = full_fft.get("fft_radial_plot_path")
         if rad_p and os.path.exists(rad_p):
-            st.image(rad_p, caption="1D Azimuthal Power Profile (Full Frame)", use_container_width=True)
+            st.image(rad_p, caption="Full-Frame Detail Drop-Off vs. 1/f Camera Trend", use_container_width=True)
 
-    f_metrics = full_fft.get("metrics", {})
-    st.table(
-        {
-            "Full-Frame FFT Metric": [
-                "Full-Frame FFT Score",
-                "Suspicion Level",
-                "Frame Resolution",
-                "High-Frequency Energy Ratio",
-                "Max Periodic Spike Z-Score",
-                "Top-20 Spike Mean Z-Score",
-                "Spike Density (>4σ)",
-                "Radial Curve Roughness",
-            ],
-            "Observed Value": [
-                f"{full_fft['fft_score']:.4f}",
-                str(full_fft["suspicion_level"]).upper(),
-                f"{full_fft['image_resolution'][0]} x {full_fft['image_resolution'][1]} px",
-                str(f_metrics.get("hf_energy_ratio")),
-                str(f_metrics.get("max_spike_z")),
-                str(f_metrics.get("top20_spike_mean_z")),
-                str(f_metrics.get("spike_density")),
-                str(f_metrics.get("radial_roughness")),
-            ],
-        }
+    st.write("")
+
+    _render_verdict_and_details(
+        fft_translation,
+        verdict_title="2D-FFT Verdict",
+        expander_label="📖 Detailed Plain-English 2D-FFT Explanation",
     )
 
-    st.markdown("##### 🎯 Unwarped Raw Face BBox 2D-FFT (Zero Affine / Bicubic Distortion)")
-    if not face_ffts:
-        st.info(
-            "No valid face bounding boxes (>= 32x32 px) in this frame; full-frame 2D-FFT is used."
+    with st.expander("📊 Technical 2D-FFT Metrics (For Forensic Reviewers)", expanded=False):
+        if face_ffts:
+            for f_fft in face_ffts:
+                fm = f_fft.get("metrics", {})
+                st.markdown(
+                    f"**{f_fft['global_face_id']}** — BBox `{f_fft['bbox']}` | "
+                    f"Score: `{f_fft['fft_score']:.4f} ({f_fft['fft_score'] * 100:.0f}%)` "
+                    f"(`{str(f_fft['suspicion_level']).upper()}`)"
+                )
+                st.table(
+                    {
+                        "Face-ROI FFT Metric": [
+                            "Luminance HF Energy Ratio",
+                            "Chrominance (Cb/Cr) HF Ratio",
+                            "Max Periodic Spike Z-Score",
+                            "Top-20 Spike Mean Z-Score",
+                            "Spike Density (>4σ)",
+                            "Radial Curve Roughness",
+                            "1/f Decay Fit RMSE",
+                            "Spectral Slope (alpha)",
+                        ],
+                        "Observed Value": [
+                            str(fm.get("hf_energy_ratio")),
+                            str(fm.get("chroma_hf_ratio")),
+                            str(fm.get("max_spike_z")),
+                            str(fm.get("top20_spike_mean_z")),
+                            str(fm.get("spike_density")),
+                            str(fm.get("radial_roughness")),
+                            str(fm.get("radial_fit_rmse")),
+                            str(fm.get("spectral_slope")),
+                        ],
+                    }
+                )
+
+        f_metrics = full_fft.get("metrics", {})
+        st.markdown("**Full Raw Frame 2D-FFT Metrics**")
+        st.table(
+            {
+                "Full-Frame FFT Metric": [
+                    "Full-Frame FFT Score",
+                    "Suspicion Level",
+                    "Active Content Resolution",
+                    "Luminance HF Energy Ratio",
+                    "Chrominance (Cb/Cr) HF Ratio",
+                    "Max Periodic Spike Z-Score",
+                    "Top-20 Spike Mean Z-Score",
+                    "Spike Density (>4σ)",
+                    "Radial Curve Roughness",
+                    "1/f Decay Fit RMSE",
+                    "Spectral Slope (alpha)",
+                ],
+                "Observed Value": [
+                    f"{full_fft['fft_score']:.4f} ({full_fft['fft_score'] * 100:.0f}%)",
+                    str(full_fft["suspicion_level"]).upper(),
+                    f"{full_fft['image_resolution'][0]} x {full_fft['image_resolution'][1]} px",
+                    str(f_metrics.get("hf_energy_ratio")),
+                    str(f_metrics.get("chroma_hf_ratio")),
+                    str(f_metrics.get("max_spike_z")),
+                    str(f_metrics.get("top20_spike_mean_z")),
+                    str(f_metrics.get("spike_density")),
+                    str(f_metrics.get("radial_roughness")),
+                    str(f_metrics.get("radial_fit_rmse")),
+                    str(f_metrics.get("spectral_slope")),
+                ],
+            }
         )
-        return
-
-    for f_fft in face_ffts:
-        with st.container(border=True):
-            st.markdown(
-                f"**{f_fft['global_face_id']}** — Unwarped BBox `{f_fft['bbox']}` | "
-                f"FFT Score: `{f_fft['fft_score']:.4f}` (`{str(f_fft['suspicion_level']).upper()}`)"
-            )
-            col_crop, col_spec, col_rad = st.columns([0.8, 1.1, 1.1])
-            with col_crop:
-                if os.path.exists(f_fft["raw_crop_path"]):
-                    st.image(
-                        f_fft["raw_crop_path"],
-                        caption=f"Unwarped Raw Slice ({f_fft['image_resolution'][0]}x{f_fft['image_resolution'][1]})",
-                        use_container_width=True,
-                    )
-            with col_spec:
-                if f_fft.get("fft_spectrum_path") and os.path.exists(f_fft["fft_spectrum_path"]):
-                    st.image(
-                        f_fft["fft_spectrum_path"],
-                        caption="Face ROI 2D-FFT Spectrum",
-                        use_container_width=True,
-                    )
-            with col_rad:
-                if f_fft.get("fft_radial_plot_path") and os.path.exists(f_fft["fft_radial_plot_path"]):
-                    st.image(
-                        f_fft["fft_radial_plot_path"],
-                        caption="Face ROI 1D Radial Spectrum",
-                        use_container_width=True,
-                    )
-
-            fm = f_fft.get("metrics", {})
-            st.table(
-                {
-                    "Face-ROI FFT Metric": [
-                        "High-Frequency Energy Ratio",
-                        "Max Periodic Spike Z-Score",
-                        "Top-20 Spike Mean Z-Score",
-                        "Spike Density (>4σ)",
-                        "Radial Curve Roughness",
-                    ],
-                    "Observed Value": [
-                        str(fm.get("hf_energy_ratio")),
-                        str(fm.get("max_spike_z")),
-                        str(fm.get("top20_spike_mean_z")),
-                        str(fm.get("spike_density")),
-                        str(fm.get("radial_roughness")),
-                    ],
-                }
-            )
 
 
 def _render_module3_frame_record(frame_m3: dict) -> None:
-    """Render parsed Module 3 frame-level summary record and plain-English takeaways without raw JSON."""
-    st.markdown("##### 📄 Frame-Level Module 3 Forensic Record")
+    """Render frame-level Module 3 verdict, plain-English takeaways, and tucked technical record."""
+    st.markdown("##### 📄 Frame-Level Module 3 Summary")
 
-    interp = frame_m3.get("interpretation", {})
-    if interp:
-        sev = str(interp.get("severity", "low")).lower()
-        headline = interp.get("headline", "")
+    interp = frame_m3.get("interpretation", {}) or {}
+    sev = str(interp.get("severity", "low")).lower()
+    headline = interp.get("headline", "")
+
+    if headline:
         if sev == "high":
-            st.error(f"**Frame Conclusion:** {headline}")
+            st.error(f"**Frame Verdict:** {headline}")
         elif sev == "medium":
-            st.warning(f"**Frame Conclusion:** {headline}")
+            st.warning(f"**Frame Verdict:** {headline}")
         else:
-            st.success(f"**Frame Conclusion:** {headline}")
+            st.success(f"**Frame Verdict:** {headline}")
 
-        for takeaway in interp.get("key_takeaways", []):
-            st.info(takeaway)
+    takeaways = interp.get("key_takeaways", []) or []
+    if takeaways:
+        with st.expander("📖 Detailed Frame Breakdown (Noise, FFT & ELA)", expanded=False):
+            for takeaway in takeaways:
+                st.markdown(f"- {takeaway}")
 
     s = frame_m3["summary"]
-    st.table(
-        {
-            "Module 3 Property": [
-                "Frame Index",
-                "Source Raw Frame",
-                "ELA Score (Suspicion)",
-                "Full-Frame FFT Score",
-                "Max Unwarped Face FFT Score",
-                "Effective FFT Score (Suspicion)",
-                "Combined Module 3 Score (Suspicion)",
-                "Saved Module 3 Record (.json)",
-            ],
-            "Observed Value": [
-                str(frame_m3["frame_index"]),
-                frame_m3["frame_path"],
-                f"{s['ela_score']:.4f} ({str(s['ela_suspicion']).upper()})",
-                f"{s['frame_fft_score']:.4f}",
-                f"{s['max_face_fft_score']:.4f}" if s["max_face_fft_score"] is not None else "N/A",
-                f"{s['effective_fft_score']:.4f} ({str(s['fft_suspicion']).upper()})",
-                f"{s['combined_module3_score']:.4f} ({str(s['combined_suspicion']).upper()})",
-                frame_m3["record_json_path"],
-            ],
-        }
-    )
+    with st.expander("📊 Technical Frame Record & File Paths", expanded=False):
+        st.table(
+            {
+                "Module 3 Property": [
+                    "Frame Index",
+                    "Source Raw Frame",
+                    "Noise & Boundary Score",
+                    "Full-Frame FFT Score",
+                    "Max Unwarped Face FFT Score",
+                    "Effective FFT Score",
+                    "ELA Score (Included in Score?)",
+                    "Combined Module 3 Score",
+                    "Saved Module 3 Record (.json)",
+                ],
+                "Observed Value": [
+                    str(frame_m3["frame_index"]),
+                    frame_m3["frame_path"],
+                    f"{s['noise_score']:.4f} ({s['noise_score'] * 100:.0f}% — {str(s['noise_suspicion']).upper()})",
+                    f"{s['frame_fft_score']:.4f} ({s['frame_fft_score'] * 100:.0f}%)",
+                    f"{s['max_face_fft_score']:.4f} ({s['max_face_fft_score'] * 100:.0f}%)"
+                    if s["max_face_fft_score"] is not None
+                    else "N/A",
+                    f"{s['effective_fft_score']:.4f} ({s['effective_fft_score'] * 100:.0f}% — {str(s['fft_suspicion']).upper()})",
+                    f"{s['ela_score']:.4f} ({'Yes' if s.get('ela_used_in_score') else 'No — Non-JPEG'})",
+                    f"{s['combined_module3_score']:.4f} ({s['combined_module3_score'] * 100:.0f}% — {str(s['combined_suspicion']).upper()})",
+                    frame_m3["record_json_path"],
+                ],
+            }
+        )
 
 
 # Page Configuration
@@ -710,6 +913,34 @@ st.markdown(
         padding: 12px 16px;
         border: 1px solid #2e3846;
         margin-bottom: 8px;
+    }
+    .status-banner {
+        border-radius: 10px;
+        padding: 12px 18px;
+        margin: 8px 0 14px 0;
+        border-left: 6px solid;
+    }
+    .status-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+    }
+    .status-sub {
+        font-size: 0.90rem;
+        opacity: 0.9;
+        margin-top: 4px;
+    }
+    .status-low {
+        background-color: rgba(33, 195, 84, 0.14);
+        border-color: #21c354;
+    }
+    .status-medium {
+        background-color: rgba(255, 189, 46, 0.16);
+        border-color: #ffbd2e;
+    }
+    .status-high {
+        background-color: rgba(255, 75, 75, 0.16);
+        border-color: #ff4b4b;
     }
     </style>
     """,
@@ -776,17 +1007,16 @@ sel_max_frames = st.sidebar.slider(
 )
 
 sel_ela_quality = st.sidebar.slider(
-    "Module 3 ELA JPEG Quality",
+    "Module 3 ELA JPEG Quality (Native JPEGs)",
     min_value=50,
     max_value=99,
     value=int(current_cfg.get("ela_quality", 90)),
     step=1,
     disabled=is_locked,
-    help="Re-compression JPEG quality used by Error Level Analysis (ELA) on raw frames.",
+    help="Re-compression JPEG quality used by Error Level Analysis (ELA) on native JPEG images.",
 )
 
 st.sidebar.markdown("---")
-# Lock / Unlock button to control forensic pipeline execution
 if not is_locked:
     if st.sidebar.button(
         "🔒 Apply Settings (Lock)", use_container_width=True, type="primary"
@@ -805,7 +1035,6 @@ else:
     st.sidebar.success("🔒 Configuration is LOCKED for evidence integrity.")
     if st.sidebar.button("🔓 Unlock & Edit Settings", use_container_width=True):
         st.session_state["settings_locked"] = False
-        # Clear cached results so the user can edit parameters
         st.session_state["m2_result"] = None
         st.session_state["m3_result"] = None
         st.session_state.pop("m2_cache_key", None)
@@ -829,7 +1058,6 @@ if uploaded_file is not None:
         f"{uploaded_file.name}_{uploaded_file.size}_{upload_buf_hash}"
     )
 
-    # Save a single timestamped copy into data/raw/ per uploaded file (avoid duplicates on reruns)
     existing_raw_path = st.session_state.get("active_raw_path")
     if (
         st.session_state.get("active_upload_sig") != upload_sig
@@ -900,13 +1128,12 @@ if uploaded_file is not None:
         file_sha = hashes["SHA-256"][:8] if hashes else "nohash"
         cache_key = (
             f"{file_sha}_{active_cfg['detector_backend']}_{active_cfg['min_confidence']:.2f}_"
-            f"{active_cfg['output_size']}_{active_cfg['max_frames']}_{active_cfg['ela_quality']}"
+            f"{active_cfg['output_size']}_{active_cfg['max_frames']}_{active_cfg['ela_quality']}_m3v2"
         )
 
-        # Execute Module 2 & Module 3 only when locked and not yet cached
         if st.session_state.get("m2_cache_key") != cache_key:
             with st.spinner(
-                f"Executing Module 2 ({active_cfg['detector_backend'].upper()}) & Module 3 (ELA + 2D-FFT on raw frames)..."
+                f"Executing Module 2 ({active_cfg['detector_backend'].upper()}) & Module 3 (Noise, Upgraded 2D-FFT, ELA)..."
             ):
                 try:
                     short_case_id = _unique_timestamped_name(PROCESSED_ROOT, original_stem)
@@ -1116,27 +1343,40 @@ if uploaded_file is not None:
                 )
 
             # =================================================
-            # MODULE 3: PIXEL-LEVEL FORENSICS (ELA & 2D-FFT)
+            # MODULE 3: SIGNAL-LEVEL FORENSICS (NOISE, FFT, ELA)
             # =================================================
             if m3_res:
                 st.divider()
-                st.header("🟠 Module 3: Pixel-Level Forensics (ELA & 2D-FFT)")
+                st.header("🟠 Module 3: Signal-Level Forensics (Noise, 2D-FFT & JPEG ELA)")
                 st.caption(
-                    "Executed on unedited raw frames (`frame_path`). ELA uses Module 2 `face_bboxes` as a coordinate mask; "
-                    "2D-FFT analyzes both the full raw frame and unwarped raw face slices."
+                    "Analyzes unedited raw frames for pixel noise & face-swap blending seams (images & videos), "
+                    "spectral/frequency anomalies (2D-FFT), and double-compression history (native JPEGs)."
                 )
 
                 m3_sum = m3_res["execution_summary"]
-                mk1, mk2, mk3, mk4, mk5 = st.columns(5)
-                mk1.metric("Frames Analyzed", m3_sum["frames_analyzed"])
-                mk2.metric("Mean / Max ELA", f"{m3_sum['mean_ela_score']:.3f} / {m3_sum['max_ela_score']:.3f}")
-                mk3.metric("Mean / Max FFT", f"{m3_sum['mean_fft_score']:.3f} / {m3_sum['max_fft_score']:.3f}")
-                mk4.metric("Max Combined Score", f"{m3_sum['max_module3_score']:.3f}")
-                mk5.metric("Module 3 Suspicion", str(m3_sum["overall_suspicion"]).upper())
 
-                _render_translation_block(
-                    m3_res.get("interpretation"),
-                    title="Overall Module 3 Plain-English Takeaways",
+                _render_suspicion_box(
+                    title="Module 3 Suspicion",
+                    severity=m3_sum["overall_suspicion"],
+                    score=m3_sum["max_module3_score"],
+                    subtitle="Quick glance across analyzed frame(s) — inspect visuals below or scroll to the Audit Summary for the full verdict.",
+                )
+
+                mk1, mk2, mk3, mk4 = st.columns(4)
+                mk1.metric("Frames Analyzed", m3_sum["frames_analyzed"])
+                mk2.metric(
+                    "Noise & Boundary (Mean / Peak)",
+                    f"{m3_sum['mean_noise_score'] * 100:.0f}% / {m3_sum['max_noise_score'] * 100:.0f}%",
+                )
+                mk3.metric(
+                    "2D-FFT Spectrum (Mean / Peak)",
+                    f"{m3_sum['mean_fft_score'] * 100:.0f}% / {m3_sum['max_fft_score'] * 100:.0f}%",
+                )
+                mk4.metric(
+                    "JPEG ELA (Mean / Peak)" if m3_sum.get("ela_used_in_scoring") else "JPEG ELA (Video/PNG)",
+                    f"{m3_sum['mean_ela_score'] * 100:.0f}% / {m3_sum['max_ela_score'] * 100:.0f}%"
+                    if m3_sum.get("ela_used_in_scoring")
+                    else "Excluded (Non-JPEG)",
                 )
 
                 total_m3_frames = len(m3_res["frames_detail"])
@@ -1162,9 +1402,10 @@ if uploaded_file is not None:
 
                     current_m3 = m3_res["frames_detail"][m3_frame_idx - 1]
                     m3_modes = [
-                        "🔥 1. Error Level Analysis (ELA)",
-                        "📡 2. 2D-FFT Spectrum (Frame & Raw Face)",
-                        "📄 3. Frame Module 3 Record",
+                        "🔬 1. Noise & Boundary Analysis",
+                        "📡 2. 2D-FFT Spectrum (Face & Frame)",
+                        "🔥 3. Error Level Analysis (ELA)",
+                        "📄 4. Frame Module 3 Summary",
                     ]
 
                     st.write("")
@@ -1187,53 +1428,83 @@ if uploaded_file is not None:
                         )
 
                     cur_s = current_m3["summary"]
-                    st.write("")
-                    st.info(
-                        f"**Active Frame:** #{m3_frame_idx} (`{Path(current_m3['frame_path']).name}`) | "
-                        f"**ELA:** `{cur_s['ela_score']:.4f}` (`{cur_s['ela_suspicion'].upper()}`) | "
-                        f"**Effective FFT:** `{cur_s['effective_fft_score']:.4f}` (`{cur_s['fft_suspicion'].upper()}`)"
+                    noise_lbl, _, _ = _suspicion_display(
+                        cur_s["noise_suspicion"], cur_s["noise_score"]
+                    )
+                    fft_lbl, _, _ = _suspicion_display(
+                        cur_s["fft_suspicion"], cur_s["effective_fft_score"]
+                    )
+                    ela_lbl = (
+                        _suspicion_display(cur_s["ela_suspicion"], cur_s["ela_score"])[0]
+                        if cur_s.get("ela_used_in_score")
+                        else "N/A (Non-JPEG)"
+                    )
+                    _render_suspicion_box(
+                        title=f"Frame #{m3_frame_idx} Status",
+                        severity=cur_s["combined_suspicion"],
+                        score=cur_s["combined_module3_score"],
+                        subtitle=(
+                            f"File: {Path(current_m3['frame_path']).name} | "
+                            f"Noise: {noise_lbl} | 2D-FFT: {fft_lbl} | ELA: {ela_lbl}"
+                        ),
                     )
 
                     if m3_mode == m3_modes[0]:
-                        _render_module3_ela(
-                            current_m3["ela"],
-                            ela_translation=current_m3.get("interpretation", {}).get("ela"),
+                        _render_module3_noise(
+                            current_m3["noise"],
+                            noise_translation=current_m3.get("interpretation", {}).get("noise"),
                         )
                     elif m3_mode == m3_modes[1]:
                         _render_module3_fft(current_m3)
                     elif m3_mode == m3_modes[2]:
+                        _render_module3_ela(
+                            current_m3["ela"],
+                            ela_translation=current_m3.get("interpretation", {}).get("ela"),
+                        )
+                    elif m3_mode == m3_modes[3]:
                         _render_module3_frame_record(current_m3)
 
+                # =============================================
+                # MODULE 3 AUDIT SUMMARY & OVERALL VERDICT
+                # =============================================
                 st.divider()
                 st.subheader("📋 Module 3 Forensic Audit Summary")
+
+                _render_verdict_and_details(
+                    m3_res.get("interpretation"),
+                    verdict_title="Overall Module 3 Verdict",
+                    expander_label="📖 Detailed Multi-Frame Breakdown & Limitations",
+                )
+
                 m3_c1, m3_c2 = st.columns([2, 1])
                 with m3_c1:
-                    st.table(
-                        {
-                            "Module 3 Property": [
-                                "Case Identifier",
-                                "Audit Timestamp",
-                                "Input Source",
-                                "ELA JPEG Quality",
-                                "Mean / Max ELA Score",
-                                "Mean / Max Effective FFT Score",
-                                "Mean / Max Module 3 Score",
-                                "Overall Module 3 Suspicion",
-                                "Module 3 Manifest File",
-                            ],
-                            "Observed Value": [
-                                m3_res["forensics_metadata"]["case_id"],
-                                m3_res["forensics_metadata"]["timestamp"],
-                                m3_res["module3_settings"]["input_source"],
-                                f"Q={m3_res['module3_settings']['ela_quality']}",
-                                f"{m3_sum['mean_ela_score']:.4f} / {m3_sum['max_ela_score']:.4f}",
-                                f"{m3_sum['mean_fft_score']:.4f} / {m3_sum['max_fft_score']:.4f}",
-                                f"{m3_sum['mean_module3_score']:.4f} / {m3_sum['max_module3_score']:.4f}",
-                                str(m3_sum["overall_suspicion"]).upper(),
-                                m3_res["artifacts_directory"]["manifest"],
-                            ],
-                        }
-                    )
+                    with st.expander("🗂️ Technical Audit Metadata & Manifest Path", expanded=False):
+                        st.table(
+                            {
+                                "Module 3 Property": [
+                                    "Case Identifier",
+                                    "Audit Timestamp",
+                                    "Active Signals",
+                                    "Mean / Max Noise Score",
+                                    "Mean / Max Effective FFT Score",
+                                    "ELA Used in Scoring",
+                                    "Mean / Max Module 3 Score",
+                                    "Overall Module 3 Suspicion",
+                                    "Module 3 Manifest File",
+                                ],
+                                "Observed Value": [
+                                    m3_res["forensics_metadata"]["case_id"],
+                                    m3_res["forensics_metadata"]["timestamp"],
+                                    ", ".join(m3_res["module3_settings"]["active_signals"]),
+                                    f"{m3_sum['mean_noise_score']:.4f} / {m3_sum['max_noise_score']:.4f}",
+                                    f"{m3_sum['mean_fft_score']:.4f} / {m3_sum['max_fft_score']:.4f}",
+                                    "Yes (Native JPEG)" if m3_sum.get("ela_used_in_scoring") else "No (Non-JPEG / Video PNG)",
+                                    f"{m3_sum['mean_module3_score']:.4f} / {m3_sum['max_module3_score']:.4f}",
+                                    str(m3_sum["overall_suspicion"]).upper(),
+                                    m3_res["artifacts_directory"]["manifest"],
+                                ],
+                            }
+                        )
                 with m3_c2:
                     m3_manifest_str = json.dumps(m3_res, ensure_ascii=False, indent=2)
                     st.download_button(

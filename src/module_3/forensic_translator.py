@@ -4,9 +4,9 @@ from typing import Any, Dict, List
 
 class Module3ForensicTranslator:
     """
-    Deterministic Rule-Based Forensic Translator for Module 3 (ELA & 2D-FFT).
-    Converts quantitative pixel- and frequency-domain metrics into plain-English
-    explanations for non-expert investigators without using LLMs.
+    Deterministic Rule-Based Forensic Translator for Module 3
+    (Noise Residual & Boundary Analysis, Calibrated 2D-FFT, and JPEG ELA).
+    Metric keys match NoiseAnalyzer, FFTAnalyzer, and ELAAnalyzer 1:1.
     """
 
     @staticmethod
@@ -17,9 +17,184 @@ class Module3ForensicTranslator:
             return "medium"
         return "low"
 
+    @staticmethod
+    def _friendly_level(severity: str) -> str:
+        sev = str(severity).lower()
+        if sev == "high":
+            return "High Suspicion"
+        if sev == "medium":
+            return "Moderate Suspicion"
+        return "Low Suspicion"
+
+    @staticmethod
+    def _pct(score: float) -> str:
+        return f"{float(score) * 100:.0f}%"
+
+    def interpret_noise(self, noise_res: Dict[str, Any]) -> Dict[str, Any]:
+        noise_score = float(noise_res.get("noise_score", 0.0))
+        suspicion = str(
+            noise_res.get("suspicion_level", self._severity_label(noise_score))
+        ).lower()
+        level_label = self._friendly_level(suspicion)
+        pct = self._pct(noise_score)
+        metrics = noise_res.get("metrics", {}) or {}
+
+        p95_p50 = float(metrics.get("noise_p95_p50_ratio", 1.0))
+        block_cv = float(metrics.get("noise_block_cv", 0.0))
+        face_noise = metrics.get("face_noise_median")
+        bg_noise = metrics.get("bg_noise_median")
+        face_contrast = metrics.get("face_bg_noise_contrast")
+        face_smoother = metrics.get("face_smoother_than_bg")
+        chroma_contrast = metrics.get("face_bg_chroma_contrast")
+        seam_ratio = metrics.get("boundary_seam_ratio")
+
+        findings: List[Dict[str, str]] = []
+
+        if suspicion == "high":
+            headline = (
+                f"{level_label} ({pct}) — Strong noise or blending mismatches were found. "
+                "The skin grain inside the face or along its edges differs sharply from the rest of the frame, "
+                "which can happen in face-swaps or localized AI edits."
+            )
+        elif suspicion == "medium":
+            headline = (
+                f"{level_label} ({pct}) — Moderate noise or blending differences appear in this frame. "
+                "The face texture or perimeter behaves somewhat differently from the surrounding scene."
+            )
+        else:
+            headline = (
+                f"{level_label} ({pct}) — Pixel grain looks consistent across the frame. "
+                "No strong face-swap blending seams or noise-floor mismatches stood out."
+            )
+
+        # 1. Face vs Background Skin Noise Floor
+        if face_contrast is not None and face_noise is not None and bg_noise is not None:
+            c_val = float(face_contrast)
+            direction_text = (
+                "smoother (less natural grain) than the background"
+                if face_smoother
+                else "noisier or sharper than the background"
+            )
+            if c_val >= 0.90:
+                findings.append(
+                    {
+                        "title": "Strong Noise Mismatch Between Face Skin and Scene",
+                        "severity": "alert",
+                        "detail": (
+                            f"The face skin looks noticeably {direction_text}. "
+                            "Real camera scenes usually share a consistent sensor grain; pasted or AI-generated faces often do not."
+                        ),
+                    }
+                )
+            elif c_val >= 0.45:
+                findings.append(
+                    {
+                        "title": "Moderate Noise Difference Between Face Skin and Scene",
+                        "severity": "warning",
+                        "detail": (
+                            f"The face skin appears somewhat {direction_text}. "
+                            "This can happen with face-swaps, beauty smoothing, or strong background blur."
+                        ),
+                    }
+                )
+            else:
+                findings.append(
+                    {
+                        "title": "Consistent Face and Background Noise",
+                        "severity": "ok",
+                        "detail": "The fine pixel grain on the face skin matches the surrounding scene well.",
+                    }
+                )
+        else:
+            findings.append(
+                {
+                    "title": "No Face Mask Comparison",
+                    "severity": "info",
+                    "detail": "No valid face box was available, so only global frame noise uniformity was checked.",
+                }
+            )
+
+        # 2. Color-channel noise check
+        if chroma_contrast is not None and float(chroma_contrast) >= 0.60:
+            findings.append(
+                {
+                    "title": "Color-Grain Mismatch Inside Face",
+                    "severity": "warning",
+                    "detail": (
+                        "Fine color noise inside the face differs noticeably from the rest of the frame, "
+                        "which can occur when a face is inserted from a different source or AI model."
+                    ),
+                }
+            )
+
+        # 3. Face perimeter blending seam check
+        if seam_ratio is not None:
+            sr_val = float(seam_ratio)
+            if sr_val >= 2.25:
+                findings.append(
+                    {
+                        "title": "Possible Face-Border Blending Seam",
+                        "severity": "alert",
+                        "detail": (
+                            "Unusual texture transitions appear right along the outer border of the face, "
+                            "which can indicate a pasted or feathered face-swap mask."
+                        ),
+                    }
+                )
+            elif sr_val >= 1.70:
+                findings.append(
+                    {
+                        "title": "Mild Edge Transition Around Face",
+                        "severity": "warning",
+                        "detail": (
+                            "A slight texture transition appears around the face perimeter; "
+                            "check the heatmap along the jawline and cheeks."
+                        ),
+                    }
+                )
+
+        # 4. Global noise uniformity
+        if p95_p50 >= 6.0 or block_cv >= 1.35:
+            findings.append(
+                {
+                    "title": "Uneven Noise Patches Across Frame",
+                    "severity": "warning",
+                    "detail": (
+                        "Some patches of the frame have noticeably heavier or smoother grain than others, "
+                        "which can point to pasted regions, graphic overlays, or selective retouching."
+                    ),
+                }
+            )
+        else:
+            findings.append(
+                {
+                    "title": "Steady Background Grain",
+                    "severity": "ok",
+                    "detail": "Noise levels across patches stay within a normal natural range.",
+                }
+            )
+
+        user_guidance = (
+            "How to read the images above: The left image strips away colors and lighting to show only tiny pixel grain; "
+            "the heatmap on the right shows smooth/low-grain areas in dark blue and high-grain areas in yellow-red. "
+            "Look for an unnatural contrast between smooth face skin and the neck/background."
+        )
+
+        return {
+            "headline": headline,
+            "severity": suspicion,
+            "findings": findings,
+            "user_guidance": user_guidance,
+        }
+
     def interpret_ela(self, ela_res: Dict[str, Any]) -> Dict[str, Any]:
         ela_score = float(ela_res.get("ela_score", 0.0))
-        suspicion = str(ela_res.get("suspicion_level", self._severity_label(ela_score))).lower()
+        suspicion = str(
+            ela_res.get("suspicion_level", self._severity_label(ela_score))
+        ).lower()
+        level_label = self._friendly_level(suspicion)
+        pct = self._pct(ela_score)
+
         is_jpeg = bool(ela_res.get("is_jpeg", False))
         orig_fmt = str(ela_res.get("original_format", "UNKNOWN")).upper()
         metrics = ela_res.get("metrics", {}) or {}
@@ -33,172 +208,115 @@ class Module3ForensicTranslator:
 
         findings: List[Dict[str, str]] = []
 
-        # 1. Overall ELA verdict headline
-        if suspicion == "high":
+        if not is_jpeg:
             headline = (
-                f"High compression inconsistency detected (ELA Score: {ela_score:.2f}). "
-                "Different regions react very differently to JPEG re-compression, which can indicate spliced/edited areas or heavy graphic overlays."
+                f"Not Applicable for Scoring ({orig_fmt} Source) — This frame is not a native JPEG photo, "
+                "so ELA is shown for reference only and excluded from the Module 3 score."
+            )
+        elif suspicion == "high":
+            headline = (
+                f"{level_label} ({pct}) — Noticeable compression differences were found across this JPEG. "
+                "Some areas react very differently when re-saved, which can happen when faces or objects are pasted or edited."
             )
         elif suspicion == "medium":
             headline = (
-                f"Moderate compression inconsistency detected (ELA Score: {ela_score:.2f}). "
-                "Some localized differences exist between regions, warranting visual inspection."
+                f"{level_label} ({pct}) — Some compression differences appear across this JPEG. "
+                "Certain areas react differently when re-saved, so a closer visual check is recommended."
             )
         else:
             headline = (
-                f"Low compression inconsistency (ELA Score: {ela_score:.2f}). "
-                "Pixel compression errors appear relatively uniform across the frame."
+                f"{level_label} ({pct}) — Compression looks consistent across this JPEG. "
+                "No strong signs of pasted or heavily re-edited patches were found."
             )
 
-        # 2. Input format reliability rule
         if is_jpeg:
             findings.append(
                 {
-                    "title": "Native JPEG Input",
+                    "title": "Original Photo Format (JPEG)",
                     "severity": "ok",
-                    "detail": (
-                        "The source frame is a native JPEG image, which preserves 8x8 DCT block "
-                        "compression history and makes ELA measurements reliable."
-                    ),
+                    "detail": "This image is a native JPEG photo, so compression history checks are reliable.",
                 }
             )
         else:
             findings.append(
                 {
-                    "title": f"Non-JPEG Source Format ({orig_fmt})",
+                    "title": f"Non-JPEG Source ({orig_fmt}) — Excluded from Score",
                     "severity": "info",
                     "detail": (
-                        f"This frame was analyzed as {orig_fmt} (e.g., an extracted video I-frame). "
-                        "Because it is not a native JPEG, ELA reflects re-compression sensitivity rather than "
-                        "true double-JPEG history, so moderate scores should be interpreted cautiously."
+                        f"Extracted video frames and {orig_fmt} files do not preserve original JPEG block history. "
+                        "Use the Noise & Boundary and 2D-FFT tabs for reliable signal results on this file."
                     ),
                 }
             )
 
-        # 3. Face vs. Background comparison rule
         if face_contrast is not None and face_mean is not None and bg_mean is not None:
             face_val = float(face_mean)
             bg_val = float(bg_mean)
             contrast_val = float(face_contrast)
+            direction = (
+                "reacts more strongly when re-saved than the background"
+                if face_val > bg_val
+                else "looks smoother or more compressed than the background"
+            )
 
-            if face_val > bg_val:
-                direction = "higher error than"
-                interpretation = (
-                    "This can happen when a sharper or differently compressed face is composited onto a smoother background, "
-                    "or when facial features/hair contain dense high-contrast detail."
-                )
-            else:
-                direction = "lower error than"
-                interpretation = (
-                    "This can occur when an over-smoothed or heavily compressed face sits inside a crisper background scene."
-                )
-
-            if contrast_val >= 0.50:
+            if contrast_val >= 0.65:
                 findings.append(
                     {
-                        "title": "Strong Face-vs-Background Compression Mismatch",
+                        "title": "Clear Difference Between Face and Background",
                         "severity": "alert",
-                        "detail": (
-                            f"The detected face region(s) show {direction} the surrounding background "
-                            f"(Face Mean: {face_val:.2f} vs. Background Mean: {bg_val:.2f}, Contrast: {contrast_val:.2f}). "
-                            f"{interpretation}"
-                        ),
+                        "detail": f"The face area {direction}.",
                     }
                 )
-            elif contrast_val >= 0.20:
+            elif contrast_val >= 0.35:
                 findings.append(
                     {
-                        "title": "Moderate Face-vs-Background Difference",
+                        "title": "Noticeable Difference Between Face and Background",
                         "severity": "warning",
-                        "detail": (
-                            f"The detected face region(s) show {direction} the background "
-                            f"(Face Mean: {face_val:.2f} vs. Background Mean: {bg_val:.2f}, Contrast: {contrast_val:.2f}). "
-                            f"{interpretation}"
-                        ),
+                        "detail": f"The face area {direction}.",
                     }
                 )
             else:
                 findings.append(
                     {
-                        "title": "Consistent Face and Background Compression",
+                        "title": "Face and Background Match Well",
                         "severity": "ok",
-                        "detail": (
-                            f"The face region(s) and surrounding background react similarly to re-compression "
-                            f"(Face Mean: {face_val:.2f} vs. Background Mean: {bg_val:.2f}, Contrast: {contrast_val:.2f})."
-                        ),
+                        "detail": "The face area and background react similarly when re-saved.",
                     }
                 )
-        else:
+
+        if p95_p50 >= 3.2 or block_cv >= 0.90:
             findings.append(
                 {
-                    "title": "No Face Mask Comparison",
-                    "severity": "info",
+                    "title": "Uneven Compression Patches",
+                    "severity": "warning",
                     "detail": (
-                        "No valid face bounding boxes were available for this frame, so ELA was scored purely "
-                        "from global block-level variation."
+                        "Some small patches react much more strongly than the rest of the image. "
+                        "This often shows up around edited spots, added text, or sharp overlays."
                     ),
                 }
             )
 
-        # 4. Block-grid inconsistency rule
-        if p95_p50 >= 2.5 or block_cv >= 0.85:
+        if hotspot_ratio >= 0.05:
             findings.append(
                 {
-                    "title": "Uneven Block-Level Compression Across Frame",
+                    "title": "Bright Hotspots Present",
                     "severity": "warning",
                     "detail": (
-                        f"The top 5% most reactive 16x16 blocks have {p95_p50:.2f}x the error of median blocks "
-                        f"(Block CV: {block_cv:.2f}). This points to localized high-error regions such as edited areas, "
-                        "sharp graphic overlays, or added text."
-                    ),
-                }
-            )
-        elif p95_p50 >= 1.6 or block_cv >= 0.55:
-            findings.append(
-                {
-                    "title": "Mild Spatial Error Variation",
-                    "severity": "info",
-                    "detail": (
-                        f"Some 16x16 regions differ moderately from the frame median "
-                        f"(P95/P50 Ratio: {p95_p50:.2f}x, Block CV: {block_cv:.2f})."
-                    ),
-                }
-            )
-        else:
-            findings.append(
-                {
-                    "title": "Uniform Block-Grid Behavior",
-                    "severity": "ok",
-                    "detail": (
-                        f"16x16 image blocks show steady error levels across the frame "
-                        f"(P95/P50 Ratio: {p95_p50:.2f}x, Block CV: {block_cv:.2f})."
-                    ),
-                }
-            )
-
-        # 5. Hotspot warning for non-experts
-        if hotspot_ratio >= 0.04:
-            findings.append(
-                {
-                    "title": "Concentrated Bright Error Hotspots",
-                    "severity": "warning",
-                    "detail": (
-                        f"{hotspot_ratio * 100:.1f}% of pixels stand out as statistical hotspots. "
-                        "Note: Sharp edges (text banners, logos, hairlines) naturally glow bright in ELA—focus on "
-                        "whether smooth skin areas look noticeably brighter or darker than smooth background regions."
+                        "Sharp edges like text, watermarks, or hair naturally glow bright—focus on whether "
+                        "smooth skin looks noticeably different from plain background areas."
                     ),
                 }
             )
 
         user_guidance = (
-            "How to read ELA images: Bright areas show pixels that changed most during re-saving. "
-            "Sharp text, watermarks, and hard borders naturally glow bright; look for unexpected brightness "
-            "or smoothness differences inside flat facial skin compared to flat background areas."
+            "How to read the images above: Bright areas show pixels that changed most when re-saved. "
+            "Sharp edges like text and hair naturally glow bright; look instead for smooth areas like cheeks "
+            "that stand out sharply against plain background areas."
         )
 
         return {
             "headline": headline,
-            "severity": suspicion,
+            "severity": suspicion if is_jpeg else "low",
             "findings": findings,
             "user_guidance": user_guidance,
         }
@@ -211,28 +329,31 @@ class Module3ForensicTranslator:
         frame_score = float(summary.get("frame_fft_score", full_fft.get("fft_score", 0.0)))
         max_face_score = summary.get("max_face_fft_score")
         effective_score = float(summary.get("effective_fft_score", frame_score))
-        suspicion = str(summary.get("fft_suspicion", self._severity_label(effective_score))).lower()
+        suspicion = str(
+            summary.get("fft_suspicion", self._severity_label(effective_score))
+        ).lower()
+        level_label = self._friendly_level(suspicion)
+        pct = self._pct(effective_score)
 
         findings: List[Dict[str, str]] = []
 
-        # 1. Headline
         if suspicion == "high":
             headline = (
-                f"Strong frequency-domain anomalies detected (Effective FFT Score: {effective_score:.2f}). "
-                "The spectrum contains unusual periodic spikes or elevated high-frequency energy typical of synthetic upsampling."
+                f"{level_label} ({pct}) — Strong frequency anomalies were detected. "
+                "Unusual repeating grid dots or abnormal spectral decay appear, "
+                "which commonly come from AI generation, upscaling, or face-swapping."
             )
         elif suspicion == "medium":
             headline = (
-                f"Moderate frequency-domain irregularities detected (Effective FFT Score: {effective_score:.2f}). "
-                "Mild spectral spikes or high-frequency deviations are present."
+                f"{level_label} ({pct}) — Moderate frequency irregularities were found. "
+                "Some fine-detail patterns deviate from a typical natural camera curve."
             )
         else:
             headline = (
-                f"Normal frequency-domain profile (Effective FFT Score: {effective_score:.2f}). "
-                "No strong global or face-level periodic AI checkerboard artifacts were detected."
+                f"{level_label} ({pct}) — Frequency patterns look natural. "
+                "No strong repeating AI grid traces or abnormal spectral deviations were found."
             )
 
-        # Pick the primary target with highest FFT score to inspect detailed spectral metrics
         primary_label = "Full Frame"
         primary_fft = full_fft
         if face_ffts:
@@ -246,155 +367,121 @@ class Module3ForensicTranslator:
         max_z = float(pm.get("max_spike_z", 0.0))
         spike_density = float(pm.get("spike_density", 0.0))
         hf_ratio = float(pm.get("hf_energy_ratio", 0.0))
+        chroma_hf = float(pm.get("chroma_hf_ratio", 0.0))
         roughness = float(pm.get("radial_roughness", 0.0))
+        fit_rmse = float(pm.get("radial_fit_rmse", 0.0))
+        slope = float(pm.get("spectral_slope", 1.2))
 
-        # 2. Periodic checkerboard spike rule
-        if top20_z >= 5.5 or max_z >= 7.5:
+        # 1. Periodic checkerboard grid dots
+        if top20_z >= 5.2 or max_z >= 7.0:
             findings.append(
                 {
-                    "title": f"Periodic Frequency Spikes Detected ({primary_label})",
+                    "title": f"Repeating Grid Pattern Found ({primary_label})",
                     "severity": "alert",
                     "detail": (
-                        f"Sharp repeating spikes stand out in the 2D-FFT spectrum "
-                        f"(Top-20 Spike Mean Z: {top20_z:.2f}, Max Z: {max_z:.2f}, Density: {spike_density:.5f}). "
-                        "Repeating spectral dots away from the center axes are a common fingerprint of AI/GAN upsampling."
+                        "Unusual repeating bright dots appear in the frequency scan. "
+                        "AI generators and face-swap tools often leave faint grid patterns like these."
                     ),
                 }
             )
-        elif top20_z >= 3.8 or spike_density >= 0.002:
+        elif top20_z >= 3.7 or spike_density >= 0.002:
             findings.append(
                 {
-                    "title": f"Mild Spectral Spikes ({primary_label})",
+                    "title": f"Mild Repeating Patterns ({primary_label})",
                     "severity": "warning",
                     "detail": (
-                        f"Minor localized spikes appear in the spectrum "
-                        f"(Top-20 Spike Mean Z: {top20_z:.2f}, Max Z: {max_z:.2f}). "
-                        "This can reflect mild upsampling noise or crisp repeating patterns."
+                        "A few small repeating spots appear in the frequency scan, "
+                        "which can come from AI upscaling, resizing, or regular textures."
                     ),
                 }
             )
         else:
             findings.append(
                 {
-                    "title": "No Significant Periodic Checkerboard Spikes",
+                    "title": "No Repeating AI Grid Dots Found",
                     "severity": "ok",
                     "detail": (
-                        f"No abnormal repeating peaks were found outside the center DC axes "
-                        f"(Top-20 Spike Mean Z: {top20_z:.2f}, Max Z: {max_z:.2f}). "
-                        "Note: Heavy JPEG/video compression can smooth out faint synthetic frequency traces."
+                        "No sharp repeating grid dots stood out. Note that resizing or JPEG/video compression "
+                        "can smooth out faint grid dots."
                     ),
                 }
             )
 
-        # 3. High-frequency energy & radial curve decay rule
-        if hf_ratio >= 0.72 or roughness >= 0.030:
+        # 2. 1/f spectral decay curve & slope check
+        if (
+            fit_rmse >= 0.050
+            or slope < 0.70
+            or slope > 2.45
+            or roughness >= 0.036
+            or hf_ratio >= 0.92
+            or chroma_hf >= 0.86
+        ):
             findings.append(
                 {
-                    "title": f"Elevated High-Frequency Energy or Jagged Roll-Off ({primary_label})",
+                    "title": f"Abnormal Fine-Detail Curve ({primary_label})",
                     "severity": "warning",
                     "detail": (
-                        f"High-frequency energy ratio is {hf_ratio:.3f} with radial curve roughness {roughness:.4f}. "
-                        "Natural images typically decay smoothly toward the right of the 1D radial plot; elevated or jagged tails "
-                        "can indicate artificial sharpening, synthetic textures, or resampling."
-                    ),
-                }
-            )
-        elif hf_ratio >= 0.58:
-            findings.append(
-                {
-                    "title": f"Slightly Elevated High-Frequency Tail ({primary_label})",
-                    "severity": "info",
-                    "detail": (
-                        f"High-frequency energy ratio is moderately elevated ({hf_ratio:.3f}), "
-                        f"while radial decay roughness remains {roughness:.4f}."
+                        "The orange spectrum curve bends away from a normal natural camera slope. "
+                        "This can point to synthetic textures, upscaling, heavy over-smoothing, or artificial sharpening."
                     ),
                 }
             )
         else:
             findings.append(
                 {
-                    "title": "Smooth Natural Frequency Roll-Off",
+                    "title": "Natural Detail Roll-Off",
                     "severity": "ok",
-                    "detail": (
-                        f"The 1D radial power curve drops smoothly from low to high frequencies "
-                        f"(HF Ratio: {hf_ratio:.3f}, Roughness: {roughness:.4f})."
-                    ),
+                    "detail": "The frequency curve follows a smooth, natural camera decay from left to right.",
                 }
             )
 
-        # 4. Full-frame vs. Unwarped Face ROI comparison rule
+        # 3. Face vs Full frame
         if max_face_score is not None:
             face_val = float(max_face_score)
-            if face_val >= frame_score + 0.12:
+            if face_val >= frame_score + 0.15:
                 findings.append(
                     {
-                        "title": "Frequency Anomaly Concentrated Inside Face ROI",
+                        "title": "Anomaly Concentrated Inside Face",
                         "severity": "warning",
                         "detail": (
-                            f"The isolated unwarped face crop scores higher ({face_val:.3f}) than the full frame ({frame_score:.3f}), "
-                            "indicating that spectral irregularities originate inside the face region rather than the background."
+                            f"The zoomed-in face scan ({self._pct(face_val)}) scores higher than the full frame ({self._pct(frame_score)}), "
+                            "pointing to unusual patterns inside the face region itself."
                         ),
                     }
                 )
-            elif frame_score >= face_val + 0.12:
+            elif frame_score >= face_val + 0.15:
                 findings.append(
                     {
-                        "title": "Full-Frame Layout Edges Exceed Face ROI Score",
+                        "title": "Full Frame Higher Than Face",
                         "severity": "info",
                         "detail": (
-                            f"The full frame scores higher ({frame_score:.3f}) than the isolated face crop ({face_val:.3f}). "
-                            "Straight graphic borders, split-screen dividers, or overlaid banners create bright lines in the "
-                            "full-frame 2D-FFT that do not reflect the face itself—check the isolated face spectrum below."
-                        ),
-                    }
-                )
-            else:
-                findings.append(
-                    {
-                        "title": "Consistent Full-Frame and Face-ROI Spectra",
-                        "severity": "info",
-                        "detail": (
-                            f"Full-frame FFT ({frame_score:.3f}) and peak unwarped face FFT ({face_val:.3f}) "
-                            "show consistent frequency behavior."
+                            f"The full frame ({self._pct(frame_score)}) scores higher than the isolated face ({self._pct(face_val)}), "
+                            "which can happen when background textures, banners, or graphic edges add high-frequency detail."
                         ),
                     }
                 )
 
-        # 5. Multi-face comparison rule (e.g., BEFORE vs. AFTER or two people in scene)
         if len(face_ffts) >= 2:
             best_face = max(face_ffts, key=lambda x: float(x.get("fft_score", 0.0)))
             worst_face = min(face_ffts, key=lambda x: float(x.get("fft_score", 0.0)))
             best_s = float(best_face.get("fft_score", 0.0))
             worst_s = float(worst_face.get("fft_score", 0.0))
-
-            if (best_s - worst_s) >= 0.12:
+            if (best_s - worst_s) >= 0.15:
                 findings.append(
                     {
-                        "title": "Difference Between Detected Faces",
+                        "title": "Difference Between Faces in Frame",
                         "severity": "warning",
                         "detail": (
-                            f"{best_face['global_face_id']} shows a higher frequency anomaly ({best_s:.3f}) "
-                            f"than {worst_face['global_face_id']} ({worst_s:.3f}), suggesting spectral differences "
-                            "are localized to a specific face."
-                        ),
-                    }
-                )
-            else:
-                findings.append(
-                    {
-                        "title": "Similar Frequency Profiles Across Faces",
-                        "severity": "info",
-                        "detail": (
-                            f"All {len(face_ffts)} detected faces share comparable FFT scores "
-                            f"(range: {worst_s:.3f} to {best_s:.3f})."
+                            f"{best_face['global_face_id']} ({self._pct(best_s)}) shows stronger frequency irregularity "
+                            f"than {worst_face['global_face_id']} ({self._pct(worst_s)})."
                         ),
                     }
                 )
 
         user_guidance = (
-            "How to read 2D-FFT: Bright horizontal, vertical, or tilted straight lines crossing the center come from "
-            "image borders, dividers, or text boxes. Suspect AI artifacts look like symmetric bright dots/grid patterns "
-            "away from the center lines, or bumpy spikes past the dashed line on the 1D curve."
+            "How to read the frequency images: Bright straight lines crossing the center come from normal edges "
+            "like borders or text boxes. Suspicious AI traces look like matching pairs of bright dots away from the center lines, "
+            "or the orange curve bending sharply away from the dotted blue camera trend line."
         )
 
         return {
@@ -405,33 +492,47 @@ class Module3ForensicTranslator:
         }
 
     def interpret_frame(self, frame_m3: Dict[str, Any]) -> Dict[str, Any]:
+        noise_interp = self.interpret_noise(frame_m3.get("noise", {}) or {})
         ela_interp = self.interpret_ela(frame_m3.get("ela", {}) or {})
         fft_interp = self.interpret_fft(frame_m3)
+
         summary = frame_m3.get("summary", {}) or {}
         comb_score = float(summary.get("combined_module3_score", 0.0))
-        comb_sev = str(summary.get("combined_suspicion", self._severity_label(comb_score))).lower()
+        comb_sev = str(
+            summary.get("combined_suspicion", self._severity_label(comb_score))
+        ).lower()
+        level_label = self._friendly_level(comb_sev)
+        pct = self._pct(comb_score)
+        ela_used = bool(summary.get("ela_used_in_score", False))
 
         if comb_sev == "high":
             headline = (
-                f"High pixel/frequency suspicion in this frame (Combined Score: {comb_score:.2f}). "
-                "Significant compression or spectral anomalies were flagged."
+                f"{level_label} ({pct}) — Strong signal-level anomalies (noise, frequency, or compression) "
+                "were detected in this frame."
             )
         elif comb_sev == "medium":
             headline = (
-                f"Moderate pixel/frequency suspicion in this frame (Combined Score: {comb_score:.2f}). "
-                "Review the ELA and isolated Face-ROI FFT findings before concluding."
+                f"{level_label} ({pct}) — Noticeable signal irregularities were found in this frame. "
+                "Inspect the Noise & Boundary and 2D-FFT tabs for visual clues."
             )
         else:
             headline = (
-                f"Low pixel/frequency suspicion in this frame (Combined Score: {comb_score:.2f}). "
-                "Traditional compression and spectral checks did not find strong tampering signals."
+                f"{level_label} ({pct}) — Signal-level checks look normal in this frame "
+                "(note: modern AI fakes can still require Module 4 Deep Learning to detect)."
             )
 
-        key_takeaways = [ela_interp["headline"], fft_interp["headline"]]
+        key_takeaways = [
+            f"Noise & Boundary Check: {noise_interp['headline']}",
+            f"Frequency Check (2D-FFT): {fft_interp['headline']}",
+        ]
+        if ela_used:
+            key_takeaways.append(f"JPEG Compression Check (ELA): {ela_interp['headline']}")
+
         return {
             "headline": headline,
             "severity": comb_sev,
             "key_takeaways": key_takeaways,
+            "noise": noise_interp,
             "ela": ela_interp,
             "fft": fft_interp,
         }
@@ -447,9 +548,11 @@ class Module3ForensicTranslator:
                 "findings": [],
             }
 
-        max_ela_frame = max(frames, key=lambda f: float(f["summary"]["ela_score"]))
+        max_noise_frame = max(frames, key=lambda f: float(f["summary"]["noise_score"]))
         max_fft_frame = max(frames, key=lambda f: float(f["summary"]["effective_fft_score"]))
-        max_comb_frame = max(frames, key=lambda f: float(f["summary"]["combined_module3_score"]))
+        max_comb_frame = max(
+            frames, key=lambda f: float(f["summary"]["combined_module3_score"])
+        )
 
         high_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "high")
         med_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "medium")
@@ -458,51 +561,77 @@ class Module3ForensicTranslator:
         overall_sev = str(m3_sum.get("overall_suspicion", "low")).lower()
         max_comb = float(m3_sum.get("max_module3_score", 0.0))
         mean_comb = float(m3_sum.get("mean_module3_score", 0.0))
+        level_label = self._friendly_level(overall_sev)
+        peak_pct = self._pct(max_comb)
 
         if overall_sev == "high":
             headline = (
-                f"Module 3 detected strong pixel or frequency anomalies (Peak Combined Score: {max_comb:.2f}, "
-                f"Mean: {mean_comb:.2f})."
+                f"{level_label} ({peak_pct}) — Signal forensics flagged strong noise, blending, or frequency anomalies "
+                "across the analyzed evidence."
             )
         elif overall_sev == "medium":
             headline = (
-                f"Module 3 detected moderate pixel or frequency irregularities (Peak Combined Score: {max_comb:.2f}, "
-                f"Mean: {mean_comb:.2f})."
+                f"{level_label} ({peak_pct}) — Moderate noise, blending, or frequency irregularities were detected. "
+                "Combine this evidence with AI deepfake detection (Module 4)."
             )
         else:
             headline = (
-                f"Module 3 found low overall pixel/frequency suspicion (Peak Combined Score: {max_comb:.2f}, "
-                f"Mean: {mean_comb:.2f})."
+                f"{level_label} ({peak_pct}) — No strong signal-level anomalies stood out, though modern AI-generated "
+                "media after compression often requires Module 4 (Deep Learning) to detect."
             )
 
-        findings: List[Dict[str, str]] = [
-            {
-                "title": "Frame-by-Frame Distribution",
-                "severity": "info",
-                "detail": (
-                    f"Out of {len(frames)} analyzed frame(s): {high_cnt} High, {med_cnt} Medium, and {low_cnt} Low suspicion."
-                ),
-            },
-            {
-                "title": "Peak Anomaly Locations",
-                "severity": "warning" if overall_sev in {"medium", "high"} else "ok",
-                "detail": (
-                    f"Highest ELA score ({max_ela_frame['summary']['ela_score']:.3f}) occurred at Frame #{max_ela_frame['frame_index']} "
-                    f"({Path(max_ela_frame['frame_path']).name}); highest FFT score ({max_fft_frame['summary']['effective_fft_score']:.3f}) "
-                    f"occurred at Frame #{max_fft_frame['frame_index']} ({Path(max_fft_frame['frame_path']).name}); "
-                    f"peak combined frame is Frame #{max_comb_frame['frame_index']}."
-                ),
-            },
+        findings: List[Dict[str, str]] = []
+        if len(frames) > 1:
+            findings.append(
+                {
+                    "title": "Frame-by-Frame Breakdown",
+                    "severity": "info",
+                    "detail": (
+                        f"Checked {len(frames)} frames: {high_cnt} High, {med_cnt} Moderate, and {low_cnt} Low suspicion "
+                        f"(average across frames: {self._pct(mean_comb)})."
+                    ),
+                }
+            )
+            findings.append(
+                {
+                    "title": "Most Notable Frame(s)",
+                    "severity": "warning" if overall_sev in {"medium", "high"} else "ok",
+                    "detail": (
+                        f"Peak Noise/Boundary score ({self._pct(max_noise_frame['summary']['noise_score'])}) was in Frame #{max_noise_frame['frame_index']} "
+                        f"({Path(max_noise_frame['frame_path']).name}); peak Frequency score ({self._pct(max_fft_frame['summary']['effective_fft_score'])}) "
+                        f"was in Frame #{max_fft_frame['frame_index']} ({Path(max_fft_frame['frame_path']).name}); "
+                        f"overall peak was Frame #{max_comb_frame['frame_index']}."
+                    ),
+                }
+            )
+        else:
+            s0 = frames[0]["summary"]
+            ela_note = (
+                f", and JPEG ELA scored {self._pct(s0['ela_score'])}"
+                if s0.get("ela_used_in_score")
+                else " (JPEG ELA was skipped because source is not native JPEG)"
+            )
+            findings.append(
+                {
+                    "title": "Single-Image Breakdown",
+                    "severity": "info",
+                    "detail": (
+                        f"Noise & Boundary scored {self._pct(s0['noise_score'])}, "
+                        f"Frequency (2D-FFT) scored {self._pct(s0['effective_fft_score'])}{ela_note}."
+                    ),
+                }
+            )
+
+        findings.append(
             {
                 "title": "Forensic Scope Reminder",
                 "severity": "info",
                 "detail": (
-                    "Module 3 measures traditional compression (ELA) and frequency (2D-FFT) clues only. "
-                    "Heavy social-media compression can mask these clues, while text/graphic overlays can raise ELA/FFT scores. "
-                    "Always combine these findings with Module 4 (Deep Learning + Grad-CAM) in Module 5."
+                    "Module 3 checks physical signals (sensor noise mismatches, blending borders, frequency roll-off, and native JPEG compression). "
+                    "Absence of these traces does NOT guarantee an image or video is real—always pair Module 3 with Module 4 (Deep Learning) in Module 5."
                 ),
-            },
-        ]
+            }
+        )
 
         return {
             "headline": headline,
