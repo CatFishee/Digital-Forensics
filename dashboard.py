@@ -1277,7 +1277,7 @@ sel_backend = st.sidebar.selectbox(
 )
 
 sel_confidence = st.sidebar.slider(
-    "Face Detection Strictness",
+    "Confidence Threshold",
     min_value=0.50,
     max_value=0.99,
     value=float(current_cfg["min_confidence"]),
