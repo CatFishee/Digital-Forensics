@@ -216,7 +216,7 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
     """
     Execute Module 3 on unedited raw frames & consecutive bursts:
       1. BoundaryAnalyzer (Face-Boundary Blending & Chrominance Mismatch)
-      2. TemporalAnalyzer (Consecutive Video Burst Flicker & Landmark Jitter)
+      2. TemporalAnalyzer (Multi-Face Video Burst Flicker & Landmark Jitter)
       3. NoiseAnalyzer (SRM Pixel Grain Consistency)
       4. FFTAnalyzer (2D-FFT & 1/f Spectral Decay — Unwarped Face Crops + Full Frame)
     """
@@ -256,7 +256,7 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             prefix=frame_stem,
         )
 
-        # 2. Temporal Face Flicker & Inter-Frame Consistency (Video bursts)
+        # 2. Multi-Face Temporal Face Flicker & Inter-Frame Consistency
         temporal_res = temporal_analyzer.analyze(
             burst_frames=burst_frames,
             output_dir=str(temporal_dir),
@@ -271,7 +271,7 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             prefix=frame_stem,
         )
 
-        # 4. Full-frame 2D-FFT (auto-trims solid outer margins)
+        # 4. Full-frame 2D-FFT
         full_fft_res = fft_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(fft_dir),
@@ -330,7 +330,6 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             else full_fft_res["fft_score"]
         )
 
-        # Peak-weighted fusion across active applicable signals
         active_scores = [noise_res["noise_score"], effective_fft_score]
         boundary_eval = (boundary_res.get("metrics", {}).get("faces_evaluated") or 0) > 0
         if boundary_eval:
@@ -768,6 +767,7 @@ def _render_module3_boundary(
                 "Boundary Metric": [
                     "Boundary Suspicion Score",
                     "Faces Evaluated",
+                    "Pose / Framing Warning",
                     "Seam Halo Ratio",
                     "Skin-vs-Context Color Diff (Lab)",
                     "Seam Chrominance Bleed",
@@ -776,6 +776,7 @@ def _render_module3_boundary(
                 "Observed Value": [
                     f"{boundary_res['boundary_score']:.4f} ({boundary_res['boundary_score'] * 100:.0f}%)",
                     str(m.get("faces_evaluated", 0)),
+                    "Yes (Extreme angle or covered face)" if m.get("unreliable_face_warning") else "No",
                     str(m.get("seam_halo_ratio")) if m.get("seam_halo_ratio") is not None else "N/A",
                     str(m.get("skin_context_chroma_diff")) if m.get("skin_context_chroma_diff") is not None else "N/A",
                     str(m.get("seam_chroma_bleed")) if m.get("seam_chroma_bleed") is not None else "N/A",
@@ -788,32 +789,76 @@ def _render_module3_boundary(
 def _render_module3_temporal(
     temporal_res: dict, temporal_translation: dict | None = None
 ) -> None:
-    """Render Temporal Face Flicker: Visuals -> Verdict -> Details -> Tucked Metrics."""
+    """Render Temporal Face Flicker: Side-by-side card for every tracked face + Verdict + Details + Metrics."""
     st.markdown("##### 🎞️ Frame-to-Frame Face Flicker Check (Video Only)")
     st.caption(
-        "Follows the face across consecutive frames around this frame to spot unstable features, "
+        "Follows each face across consecutive frames around this frame to spot unstable features, "
         "skin-texture flickering, or sudden brightness/color popping."
     )
 
+    tracked_faces = temporal_res.get("faces", []) or []
+    untracked_faces = temporal_res.get("untracked_faces", []) or []
+
     if temporal_res.get("applicable", False):
-        hm_p = temporal_res.get("temporal_heatmap_path")
-        pl_p = temporal_res.get("temporal_plot_path")
-        if hm_p or pl_p:
-            c1, c2 = st.columns([0.85, 1.35])
-            with c1:
-                if hm_p and os.path.exists(hm_p):
-                    st.image(
-                        hm_p,
-                        caption="Face Skin Flicker Map (Brighter = More Frame-to-Frame Flicker)",
-                        use_container_width=True,
+        if not tracked_faces:
+            st.info("No face could be tracked across at least 2 consecutive frames in this burst.")
+        else:
+            for face_item in tracked_faces:
+                f_gid = face_item.get("global_face_id") or f"Face #{face_item.get('face_index', 0)}"
+                f_score = float(face_item.get("temporal_score", 0.0))
+                f_sev = face_item.get("suspicion_level", "low")
+                f_label, f_icon, _ = _suspicion_display(f_sev, f_score)
+                f_tracked_cnt = face_item.get("tracked_frames", 0)
+                f_total_cnt = face_item.get("total_burst_frames", 0)
+                unreliable = bool(face_item.get("unreliable", False))
+
+                with st.container(border=True):
+                    header_txt = (
+                        f"**{f_gid}** — Video Flicker: {f_icon} `{f_label}` "
+                        f"({f_tracked_cnt}/{f_total_cnt} frames tracked)"
                     )
-            with c2:
-                if pl_p and os.path.exists(pl_p):
-                    st.image(
-                        pl_p,
-                        caption="Color, Brightness & Texture Stability Across Consecutive Frames",
-                        use_container_width=True,
-                    )
+                    if unreliable:
+                        header_txt += " — *⚠️ Extreme angle or covered face*"
+                    st.markdown(header_txt)
+
+                    col_crop, col_heat, col_plot = st.columns([0.8, 1.1, 1.3])
+                    with col_crop:
+                        rc_path = face_item.get("raw_crop_path")
+                        if rc_path and os.path.exists(rc_path):
+                            st.image(
+                                rc_path,
+                                caption=f"Raw Face Crop ({f_gid})",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption(f"Raw Crop ({f_gid}) N/A")
+                    with col_heat:
+                        hm_path = face_item.get("temporal_heatmap_path")
+                        if hm_path and os.path.exists(hm_path):
+                            st.image(
+                                hm_path,
+                                caption="Skin Texture Flicker Map",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption("Flicker Heatmap N/A")
+                    with col_plot:
+                        pl_path = face_item.get("temporal_plot_path")
+                        if pl_path and os.path.exists(pl_path):
+                            st.image(
+                                pl_path,
+                                caption="Color, Brightness & Texture Stability",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption("Stability Plot N/A")
+
+        if untracked_faces:
+            untracked_desc = [
+                f"**{uf.get('global_face_id', 'Face')}**: {uf.get('reason', 'Dropped')}"
+                for uf in untracked_faces
+            ]
+            st.info("ℹ️ " + " | ".join(untracked_desc))
 
     st.write("")
     _render_verdict_and_details(
@@ -823,22 +868,30 @@ def _render_module3_temporal(
     )
 
     m = temporal_res.get("metrics", {}) or {}
+    faces_tracked_cnt = int(m.get("faces_tracked_count", 0) or 0)
+    peak_gid = m.get("peak_face_id") or (f"Face #{m.get('peak_face_index')}" if m.get("peak_face_index") is not None else "N/A")
+    tracked_str = f"{faces_tracked_cnt} (Peak: {peak_gid})" if faces_tracked_cnt > 0 else "0"
+
     with st.expander("📊 Technical Temporal Metrics (For Experts)", expanded=False):
         st.table(
             {
                 "Temporal Metric": [
                     "Applicable",
-                    "Burst Frames / Tracked Faces",
-                    "Temporal Suspicion Score",
-                    "2nd-Order Landmark Jitter",
-                    "2nd-Order BBox Jitter",
-                    "Motion-Aligned Texture Flicker Ratio",
-                    "2nd-Order Color Popping (Lab)",
-                    "2nd-Order Brightness Popping",
+                    "Burst Frames / Peak Face Steps",
+                    "Faces Tracked Independently",
+                    "Pose / Framing Warning",
+                    "Peak Temporal Suspicion Score",
+                    "2nd-Order Landmark Jitter (Peak Face)",
+                    "2nd-Order BBox Jitter (Peak Face)",
+                    "Motion-Aligned Texture Flicker (Peak Face)",
+                    "2nd-Order Color Popping Lab (Peak Face)",
+                    "2nd-Order Brightness Popping (Peak Face)",
                 ],
                 "Observed Value": [
                     "Yes (Video Burst)" if temporal_res.get("applicable") else "No (Single Image)",
                     f"{temporal_res.get('burst_frames_count', 0)} / {m.get('tracked_frames', 0)}",
+                    tracked_str,
+                    "Yes (Extreme angle or covered face)" if m.get("unreliable_face_warning") else "No",
                     f"{temporal_res['temporal_score']:.4f} ({temporal_res['temporal_score'] * 100:.0f}%)",
                     str(m.get("landmark_jitter")) if m.get("landmark_jitter") is not None else "N/A",
                     str(m.get("bbox_jitter")) if m.get("bbox_jitter") is not None else "N/A",
@@ -848,6 +901,16 @@ def _render_module3_temporal(
                 ],
             }
         )
+        if len(tracked_faces) > 1:
+            st.caption(
+                "Per-face breakdown: "
+                + ", ".join(
+                    f"{tf['global_face_id']}: {tf['temporal_score'] * 100:.0f}% "
+                    f"({tf['tracked_frames']}/{tf['total_burst_frames']} frames"
+                    + (", extreme angle/border)" if tf.get("unreliable") else ")")
+                    for tf in tracked_faces
+                )
+            )
 
 
 def _render_module3_noise(noise_res: dict, noise_translation: dict | None = None) -> None:
@@ -1214,7 +1277,7 @@ sel_backend = st.sidebar.selectbox(
 )
 
 sel_confidence = st.sidebar.slider(
-    "Confidence Threshold",
+    "Face Detection Strictness",
     min_value=0.50,
     max_value=0.99,
     value=float(current_cfg["min_confidence"]),
@@ -1356,7 +1419,7 @@ if uploaded_file is not None:
         active_cfg = st.session_state["applied_settings"]
         cache_key = (
             f"{file_sha[:8]}_{active_cfg['detector_backend']}_{active_cfg['min_confidence']:.2f}_"
-            f"{active_cfg['output_size']}_{active_cfg['max_frames']}_m3v6"
+            f"{active_cfg['output_size']}_{active_cfg['max_frames']}_m3v8"
         )
 
         if st.session_state.get("m2_cache_key") != cache_key:

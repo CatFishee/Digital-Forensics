@@ -29,17 +29,47 @@ def _imwrite_unicode(path: Path, image: np.ndarray) -> bool:
     return True
 
 
+def _is_clipped_or_extreme_profile(
+    face: Dict[str, Any], img_w: int, img_h: int
+) -> bool:
+    """
+    Detect whether a face is partially cut off at the frame border or turned into
+    an extreme side profile (used to attach an unreliability warning for users).
+    """
+    bbox = face.get("bbox", [0, 0, 0, 0])
+    if len(bbox) < 4:
+        return False
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    bw = max(x2 - x1, 1.0)
+
+    if x1 < -2.0 or y1 < -2.0 or x2 > (img_w + 2.0) or y2 > (img_h + 2.0):
+        return True
+
+    lm = face.get("landmarks") or {}
+    for pt in lm.values():
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            if pt[0] < 0 or pt[0] > img_w or pt[1] < 0 or pt[1] > img_h:
+                return True
+
+    le = lm.get("left_eye")
+    re = lm.get("right_eye")
+    nose = lm.get("nose")
+    if le and re and nose:
+        eye_dx = abs(float(re[0]) - float(le[0]))
+        min_ex = min(float(le[0]), float(re[0]))
+        max_ex = max(float(le[0]), float(re[0]))
+        nose_x = float(nose[0])
+        if eye_dx < 0.24 * bw or nose_x < (min_ex - 0.05 * bw) or nose_x > (max_ex + 0.05 * bw):
+            return True
+
+    return False
+
+
 class BoundaryAnalyzer:
     """
     Module 3.2: Face-Boundary Blending & Chrominance Mismatch Analysis.
-    Replaces ELA for both images and extracted video frames.
-    Uses Module 2's 5-point landmarks + bounding boxes to construct an oriented
-    anatomical face oval (focusing on cheeks/jawline rather than raw rectangles)
-    and inspects:
-      1. Blending seam / gradient halo along the face perimeter.
-      2. Skin-vs-immediate-context chrominance mismatch (CIE Lab a*, b*).
-      3. Chrominance edge bleed along the blending border.
-      4. Inner-face vs. outer-context sharpness mismatch (upscaled swap detection).
+    Evaluates all detected faces and flags extreme side profiles / partially covered
+    faces so the UI can warn the user when results may be unreliable.
     """
 
     @staticmethod
@@ -116,14 +146,13 @@ class BoundaryAnalyzer:
                     "seam_chroma_bleed": None,
                     "inner_outer_sharpness_ratio": None,
                     "faces_evaluated": 0,
+                    "unreliable_face_warning": False,
                 },
                 "boundary_overlay_path": None,
                 "boundary_heatmap_path": None,
             }
 
-        # Precompute CIE Lab & high-pass gradient maps
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l_chan = lab[:, :, 0]
         a_chan = lab[:, :, 1] - 128.0
         b_chan = lab[:, :, 2] - 128.0
 
@@ -134,13 +163,13 @@ class BoundaryAnalyzer:
             + np.abs(cv2.Laplacian(b_chan, cv2.CV_32F, ksize=3))
         )
 
-        # Normalized radial map helpers
         yy, xx = np.indices((h, w), dtype=np.float32)
 
         seam_halo_vals: List[float] = []
         chroma_diff_vals: List[float] = []
         chroma_bleed_vals: List[float] = []
         sharp_ratio_vals: List[float] = []
+        any_unreliable = False
 
         overlay_img = img_bgr.copy()
         combined_seam_energy = np.zeros((h, w), dtype=np.float32)
@@ -154,6 +183,9 @@ class BoundaryAnalyzer:
             if bw_box < 32 or bh_box < 32:
                 continue
 
+            if _is_clipped_or_extreme_profile(face, w, h):
+                any_unreliable = True
+
             cx, cy, rx, ry, angle = self._fit_face_oval(face, w, h)
             cos_a = math.cos(-angle)
             sin_a = math.sin(-angle)
@@ -164,7 +196,6 @@ class BoundaryAnalyzer:
             yr = dx * sin_a + dy * cos_a
 
             r_oval = np.sqrt((xr / max(rx, 1.0)) ** 2 + (yr / max(ry, 1.0)) ** 2)
-            # Focus on lower 70% of oval (cheeks + jawline) so top hairline/bangs do not false-trigger
             lower_face = yr >= (-0.20 * ry)
 
             inner_skin_mask = (r_oval >= 0.25) & (r_oval <= 0.72) & lower_face
@@ -174,41 +205,33 @@ class BoundaryAnalyzer:
             if not (np.any(inner_skin_mask) and np.any(seam_mask) and np.any(outer_mask)):
                 continue
 
-            # 1. Seam halo ratio (luminance Laplacian along blending contour vs inner/outer)
             seam_lap = float(np.median(lap_lum[seam_mask]))
             ref_lap = 0.5 * (
                 float(np.median(lap_lum[inner_skin_mask]))
                 + float(np.median(lap_lum[outer_mask]))
             )
-            seam_halo = seam_lap / max(ref_lap, 2.0)
-            seam_halo_vals.append(seam_halo)
+            seam_halo_vals.append(seam_lap / max(ref_lap, 2.0))
 
-            # 2. Chrominance edge bleed along the blending border
             seam_c = float(np.percentile(lap_chroma[seam_mask], 65))
             ref_c = 0.5 * (
                 float(np.percentile(lap_chroma[inner_skin_mask], 65))
                 + float(np.percentile(lap_chroma[outer_mask], 65))
             )
-            chroma_bleed = seam_c / max(ref_c, 1.2)
-            chroma_bleed_vals.append(chroma_bleed)
+            chroma_bleed_vals.append(seam_c / max(ref_c, 1.2))
 
-            # 3. Skin-vs-immediate-context chrominance distance (closest 35% of outer ring isolates neck/jaw skin)
             in_a = float(np.median(a_chan[inner_skin_mask]))
             in_b = float(np.median(b_chan[inner_skin_mask]))
             out_a = a_chan[outer_mask]
             out_b = b_chan[outer_mask]
             delta_ab = np.sqrt((out_a - in_a) ** 2 + (out_b - in_b) ** 2)
-            skin_chroma_diff = float(np.percentile(delta_ab, 35))
-            chroma_diff_vals.append(skin_chroma_diff)
+            chroma_diff_vals.append(float(np.percentile(delta_ab, 35)))
 
-            # 4. Inner-face vs outer-context sharpness ratio (catches low-res upscaled face pastes)
             inner_sharp = float(np.percentile(lap_lum[inner_skin_mask], 80))
             outer_sharp = float(np.percentile(lap_lum[outer_mask], 80))
             sharp_ratio = max(inner_sharp, 2.5) / max(outer_sharp, 2.5)
             inv_ratio = max(sharp_ratio, 1.0 / max(sharp_ratio, 1e-3))
             sharp_ratio_vals.append(inv_ratio)
 
-            # Visual accumulation
             face_zone = (r_oval <= 1.44) & lower_face
             local_anomaly = lap_chroma * 1.8 + 0.35 * lap_lum
             combined_seam_energy[face_zone] = np.maximum(
@@ -238,6 +261,7 @@ class BoundaryAnalyzer:
                     "seam_chroma_bleed": None,
                     "inner_outer_sharpness_ratio": None,
                     "faces_evaluated": 0,
+                    "unreliable_face_warning": any_unreliable,
                 },
                 "boundary_overlay_path": None,
                 "boundary_heatmap_path": None,
@@ -248,7 +272,6 @@ class BoundaryAnalyzer:
         max_chroma_bleed = float(max(chroma_bleed_vals))
         max_sharp_mismatch = float(max(sharp_ratio_vals))
 
-        # Calibrated scoring (high specificity so normal jawlines stay LOW)
         halo_term = float(np.clip((max_seam_halo - 1.90) / 1.40, 0.0, 1.0))
         bleed_term = float(np.clip((max_chroma_bleed - 1.75) / 1.25, 0.0, 1.0))
         chroma_term = float(np.clip((max_chroma_diff - 11.0) / 16.0, 0.0, 1.0))
@@ -297,6 +320,7 @@ class BoundaryAnalyzer:
                 "seam_chroma_bleed": round(max_chroma_bleed, 4),
                 "inner_outer_sharpness_ratio": round(max_sharp_mismatch, 4),
                 "faces_evaluated": len(seam_halo_vals),
+                "unreliable_face_warning": any_unreliable,
             },
             "boundary_overlay_path": overlay_path,
             "boundary_heatmap_path": heatmap_path,

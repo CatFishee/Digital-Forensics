@@ -69,7 +69,6 @@ def _is_valid_face_geometry(
     eyes_mid_y = 0.5 * (float(left_eye[1]) + float(right_eye[1]))
     mouth_mid_y = 0.5 * (float(mouth_left[1]) + float(mouth_right[1]))
 
-    # Nose must lie vertically between eye line and mouth line
     if not (eyes_mid_y < float(nose[1]) < mouth_mid_y):
         return False
 
@@ -115,7 +114,9 @@ class FaceAligner:
                 device=self.device,
             )
         else:
-            raise ValueError(f"Unsupported backend: {backend}. Choose 'retinaface' or 'mtcnn'.")
+            raise ValueError(
+                f"Unsupported backend: {backend}. Choose 'retinaface' or 'mtcnn'."
+            )
 
     def _detect(self, img_bgr: np.ndarray) -> List[Tuple[np.ndarray, float, np.ndarray]]:
         detections: List[Tuple[np.ndarray, float, np.ndarray]] = []
@@ -164,12 +165,14 @@ class FaceAligner:
             matrix = cv2.getAffineTransform(src_pts[[0, 1, 3]], dst_landmarks[[0, 1, 3]])
 
         out_w, out_h = self.output_size
+        # Fill out-of-frame regions with black instead of mirroring facial features
         return cv2.warpAffine(
             img_bgr,
             matrix,
             (out_w, out_h),
             flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
 
     def process_frame(

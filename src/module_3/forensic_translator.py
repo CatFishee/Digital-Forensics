@@ -173,6 +173,7 @@ class Module3ForensicTranslator:
         chroma_diff = metrics.get("skin_context_chroma_diff")
         chroma_bleed = metrics.get("seam_chroma_bleed")
         sharp_ratio = metrics.get("inner_outer_sharpness_ratio")
+        unreliable = bool(metrics.get("unreliable_face_warning", False))
 
         findings: List[Dict[str, str]] = []
 
@@ -203,6 +204,18 @@ class Module3ForensicTranslator:
         else:
             headline = (
                 f"{level_label} ({pct}) — The face edge and skin tone blend naturally into the neck and surroundings."
+            )
+
+        if unreliable:
+            findings.append(
+                {
+                    "title": "Extreme Angle or Covered Face",
+                    "severity": "warning",
+                    "detail": (
+                        "Extreme side profiles and partially covered or cut-off faces make border and color results unreliable. "
+                        "Raise the Confidence Threshold in the sidebar if partially hidden faces are affecting the score."
+                    ),
+                }
             )
 
         if seam_halo is not None:
@@ -326,6 +339,14 @@ class Module3ForensicTranslator:
         tex_flicker = metrics.get("texture_flicker_ratio")
         col_flicker = metrics.get("color_flicker_lab")
         lum_flicker = metrics.get("brightness_flicker")
+        unreliable = bool(metrics.get("unreliable_face_warning", False))
+        faces_tracked = int(metrics.get("faces_tracked_count", 0) or 0)
+        peak_face_id = metrics.get("peak_face_id")
+        if not peak_face_id:
+            p_idx = metrics.get("peak_face_index")
+            peak_face_id = f"Face #{p_idx}" if p_idx is not None else "Face"
+
+        per_face_scores = temporal_res.get("faces", []) or []
 
         findings: List[Dict[str, str]] = []
 
@@ -355,6 +376,36 @@ class Module3ForensicTranslator:
         else:
             headline = (
                 f"{level_label} ({pct}) — Face features, brightness, and skin texture stay steady across consecutive frames."
+            )
+
+        if unreliable:
+            findings.append(
+                {
+                    "title": "Extreme Angle or Covered Face",
+                    "severity": "warning",
+                    "detail": (
+                        "Extreme side profiles and partially covered or cut-off faces make frame-to-frame tracking unreliable. "
+                        "Raise the Confidence Threshold in the sidebar if edge faces are affecting the score."
+                    ),
+                }
+            )
+
+        if faces_tracked >= 2 and per_face_scores:
+            parts = []
+            for pf in per_face_scores:
+                gid = pf.get("global_face_id") or f"Face #{pf.get('face_index', 0)}"
+                sc_str = self._pct(pf.get("temporal_score", 0.0))
+                parts.append(f"{gid}: {sc_str}")
+
+            findings.append(
+                {
+                    "title": "All Tracked Faces in This Burst",
+                    "severity": "info",
+                    "detail": (
+                        f"Tracked {faces_tracked} faces independently: {', '.join(parts)}. "
+                        f"Highest suspicion was detected on {peak_face_id}."
+                    ),
+                }
             )
 
         if lm_jitter is not None:
