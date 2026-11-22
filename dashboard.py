@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
+import torch
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -26,6 +27,7 @@ from src.module_3 import (
     NoiseAnalyzer,
     TemporalAnalyzer,
 )
+from src.module_4 import get_cache_dir, list_available_detectors, run_module4
 
 TEMP_DIR = Path("data/raw")
 PREVIEW_DIR = TEMP_DIR / "_previews"
@@ -33,6 +35,8 @@ PROCESSED_ROOT = Path("data/processed")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_ROOT.mkdir(parents=True, exist_ok=True)
+
+FIXED_ALIGNED_FACE_SIZE = 256
 
 
 def _imread_unicode(path: Path) -> np.ndarray | None:
@@ -476,7 +480,7 @@ def _suspicion_display(severity: str, score: float | None = None) -> tuple[str, 
 def _render_m3_kpi(
     col, label: str, mean_score: float, max_score: float, is_multi: bool
 ) -> None:
-    """Render a clear Module 3 KPI metric (Peak% + Avg/Peak subtitle for multi-frame videos)."""
+    """Render a clear KPI metric (Peak% + Avg/Peak subtitle for multi-frame videos)."""
     peak_pct = f"{max_score * 100:.0f}%"
     if is_multi:
         avg_pct = f"{mean_score * 100:.0f}%"
@@ -498,7 +502,7 @@ def _make_pill_html(
     na_text: str = "N/A",
     frame_idx: int | None = None,
 ) -> str:
-    """Build an HTML colored pill badge matching the Module 3 quick-glance palette."""
+    """Build an HTML colored pill badge."""
     if not active:
         return f'<span class="m3-pill pill-na">⚪ {label}: {na_text}</span>'
     sev_l = str(sev).lower()
@@ -532,10 +536,7 @@ def _render_suspicion_box(
 
 
 def _render_frame_status_box(frame_idx: int, frame_m3: dict) -> None:
-    """
-    Render the active Frame status box with color-coded pill badges matching tabs 1..4,
-    so high/moderate suspicion tabs stand out at a quick glance.
-    """
+    """Render the active Module 3 Frame status box with color-coded pill badges."""
     s = frame_m3["summary"]
     label, icon, css_cls = _suspicion_display(
         s["combined_suspicion"], s["combined_module3_score"]
@@ -575,6 +576,49 @@ def _render_frame_status_box(frame_idx: int, frame_m3: dict) -> None:
         f"""
         <div class="status-banner {css_cls}">
             <div class="status-title">{icon} Frame #{frame_idx} Status: <span>{label}</span>
+                <span class="status-file">({file_name})</span>
+            </div>
+            <div class="pill-row">{''.join(pills)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_m4_frame_status_box(
+    frame_idx: int, frame_m4: dict, det_summaries: dict
+) -> None:
+    """Render the active Module 4 Frame status box with per-detector pill badges."""
+    if not frame_m4.get("evaluated"):
+        _render_suspicion_box(
+            title=f"Frame #{frame_idx} Deep Learning Status",
+            severity="low",
+            score=None,
+            subtitle="No face detected in this frame to evaluate.",
+        )
+        return
+
+    score = float(frame_m4.get("ensemble_fake_probability") or 0.0)
+    label, icon, css_cls = _suspicion_display(frame_m4["suspicion_level"], score)
+    file_name = Path(frame_m4["frame_path"]).name
+
+    pills = []
+    for det_id, det_frame in (frame_m4.get("detectors") or {}).items():
+        short_name = det_summaries.get(det_id, {}).get("display_name", det_id.upper())
+        pills.append(
+            _make_pill_html(
+                short_name,
+                bool(det_frame.get("evaluated")),
+                det_frame.get("suspicion_level", "low"),
+                float(det_frame.get("fake_probability") or 0.0),
+                na_text="No Face",
+            )
+        )
+
+    st.markdown(
+        f"""
+        <div class="status-banner {css_cls}">
+            <div class="status-title">{icon} Frame #{frame_idx} AI Status: <span>{label}</span>
                 <span class="status-file">({file_name})</span>
             </div>
             <div class="pill-row">{''.join(pills)}</div>
@@ -727,7 +771,7 @@ def _render_frame_forensic_record(
 def _render_module3_boundary(
     boundary_res: dict, boundary_translation: dict | None = None
 ) -> None:
-    """Render Face-Boundary Blending & Color Match: Visuals -> Verdict -> Details -> Tucked Metrics."""
+    """Render Face-Boundary Blending & Color Match."""
     st.markdown("##### 🎭 Face-Border Blending & Skin Color Check")
     st.caption(
         "Checks along the lower face outline (cheeks and jawline) for pasted blending halos "
@@ -789,7 +833,7 @@ def _render_module3_boundary(
 def _render_module3_temporal(
     temporal_res: dict, temporal_translation: dict | None = None
 ) -> None:
-    """Render Temporal Face Flicker: Side-by-side card for every tracked face + Verdict + Details + Metrics."""
+    """Render Temporal Face Flicker."""
     st.markdown("##### 🎞️ Frame-to-Frame Face Flicker Check (Video Only)")
     st.caption(
         "Follows each face across consecutive frames around this frame to spot unstable features, "
@@ -914,7 +958,7 @@ def _render_module3_temporal(
 
 
 def _render_module3_noise(noise_res: dict, noise_translation: dict | None = None) -> None:
-    """Render Noise Consistency: Visuals -> Verdict -> Details -> Tucked Metrics."""
+    """Render Noise Consistency."""
     st.markdown("##### 🔬 Pixel Grain Consistency Check")
     st.caption(
         "Hides colors and lighting to expose tiny camera grain differences—for example, "
@@ -977,7 +1021,7 @@ def _render_module3_noise(noise_res: dict, noise_translation: dict | None = None
 
 
 def _render_module3_fft(frame_m3: dict) -> None:
-    """Render 2D-FFT: Unwarped Face Crops First -> Full Frame -> Verdict -> Details -> Tucked Metrics."""
+    """Render 2D-FFT."""
     full_fft = frame_m3["fft_full_frame"]
     face_ffts = frame_m3.get("fft_unwarped_faces", [])
     fft_translation = frame_m3.get("interpretation", {}).get("fft")
@@ -1155,6 +1199,90 @@ def _render_module3_frame_record(frame_m3: dict) -> None:
         )
 
 
+def _render_module4_detector_frame(
+    det_id: str,
+    det_summary: dict,
+    det_frame: dict,
+    det_translation: dict | None,
+) -> None:
+    """Render one Module 4 detector's per-face aligned crop + Grad-CAM overlay + verdict."""
+    display_name = det_summary.get("display_name", det_id.upper())
+    st.markdown(f"##### 🧠 {display_name}")
+
+    if not det_frame.get("evaluated"):
+        st.info("No aligned face was detected in this frame to evaluate.")
+        _render_verdict_and_details(det_translation, verdict_title=f"{display_name} Verdict")
+        return
+
+    for f_res in det_frame.get("faces", []) or []:
+        f_gid = f_res.get("global_face_id") or f"Face #{f_res.get('face_index', 0)}"
+        f_prob = float(f_res.get("fake_probability", 0.0))
+        f_sev = str(f_res.get("suspicion_level", "low"))
+        f_label, f_icon, _ = _suspicion_display(f_sev, f_prob)
+        pred_tag = f_res.get("prediction_label", "REAL")
+
+        with st.container(border=True):
+            st.markdown(
+                f"**{f_gid}** — Fake Probability: {f_icon} `{f_label}` | Prediction: `{pred_tag}`"
+            )
+            c_face, c_cam, c_info = st.columns([1.0, 1.0, 1.2])
+            with c_face:
+                al_p = f_res.get("aligned_face_path")
+                if al_p and os.path.exists(al_p):
+                    st.image(
+                        al_p,
+                        caption=f"Aligned Face Input ({FIXED_ALIGNED_FACE_SIZE}x{FIXED_ALIGNED_FACE_SIZE})",
+                        use_container_width=True,
+                    )
+            with c_cam:
+                cam_p = f_res.get("gradcam_overlay_path")
+                if cam_p and os.path.exists(cam_p):
+                    st.image(
+                        cam_p,
+                        caption="Grad-CAM Suspect Regions (Warm = Higher FAKE Contribution)",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("Grad-CAM overlay disabled or unavailable.")
+            with c_info:
+                st.metric("P(Fake)", f"{f_prob * 100:.1f}%")
+                st.metric("P(Real)", f"{float(f_res.get('real_probability', 0.0)) * 100:.1f}%")
+                bands = f_res.get("fad_band_energy") or {}
+                if bands:
+                    st.caption(
+                        "**FAD DCT Band Energy:** "
+                        f"Low `{bands.get('low_band_share', 0.0) * 100:.1f}%` • "
+                        f"Mid `{bands.get('mid_band_share', 0.0) * 100:.1f}%` • "
+                        f"High `{bands.get('high_band_share', 0.0) * 100:.1f}%`"
+                    )
+
+    st.write("")
+    _render_verdict_and_details(
+        det_translation,
+        verdict_title=f"{display_name} Verdict",
+        expander_label="📖 Why did it say this? (Simple explanation)",
+    )
+
+    with st.expander("📊 Technical Deep Learning Metrics (For Experts)", expanded=False):
+        rows = {
+            "Face ID": [],
+            "P(Real)": [],
+            "P(Fake)": [],
+            "Logit (Real / Fake)": [],
+            "Grad-CAM Path": [],
+        }
+        for f_res in det_frame.get("faces", []) or []:
+            logits = f_res.get("logits", {})
+            rows["Face ID"].append(f_res.get("global_face_id", "Face"))
+            rows["P(Real)"].append(f"{float(f_res.get('real_probability', 0.0)):.4f}")
+            rows["P(Fake)"].append(f"{float(f_res.get('fake_probability', 0.0)):.4f}")
+            rows["Logit (Real / Fake)"].append(
+                f"{logits.get('real', 'N/A')} / {logits.get('fake', 'N/A')}"
+            )
+            rows["Grad-CAM Path"].append(f_res.get("gradcam_overlay_path") or "N/A")
+        st.table(rows)
+
+
 # Page Configuration
 st.set_page_config(
     page_title="Multimodal Forensics Toolkit",
@@ -1254,8 +1382,11 @@ if "applied_settings" not in st.session_state:
     st.session_state["applied_settings"] = {
         "detector_backend": "retinaface",
         "min_confidence": 0.80,
-        "output_size": 299,
+        "output_size": FIXED_ALIGNED_FACE_SIZE,
         "max_frames": 10,
+        "enable_module4": True,
+        "m4_auto_download": True,
+        "m4_gradcam": True,
     }
 
 st.title("🔍 Digital Media & Deepfake Check")
@@ -1286,12 +1417,8 @@ sel_confidence = st.sidebar.slider(
     help="Higher values ignore blurry or uncertain background faces.",
 )
 
-sel_size = st.sidebar.selectbox(
-    "Cropped Face Size",
-    options=[299, 224],
-    index=0 if current_cfg["output_size"] == 299 else 1,
-    disabled=is_locked,
-    help="299x299 matches the standard size expected by AI deepfake models (Module 4).",
+st.sidebar.caption(
+    f"📐 **Aligned Face Output:** Fixed at `{FIXED_ALIGNED_FACE_SIZE} × {FIXED_ALIGNED_FACE_SIZE}` px"
 )
 
 sel_max_frames = st.sidebar.slider(
@@ -1308,6 +1435,27 @@ sel_max_frames = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("#### 🧠 Deep Learning (Module 4)")
+sel_m4_enabled = st.sidebar.checkbox(
+    "Run Module 4 AI & Grad-CAM",
+    value=bool(current_cfg.get("enable_module4", True)),
+    disabled=is_locked,
+)
+sel_m4_auto_download = st.sidebar.checkbox(
+    "Auto-download missing AI weights",
+    value=bool(current_cfg.get("m4_auto_download", True)),
+    disabled=is_locked or not sel_m4_enabled,
+    help=f"Caches verified checkpoints in `{get_cache_dir()}` (same pattern as Module 2).",
+)
+sel_m4_gradcam = st.sidebar.checkbox(
+    "Generate Grad-CAM heatmaps (XAI)",
+    value=bool(current_cfg.get("m4_gradcam", True)),
+    disabled=is_locked or not sel_m4_enabled,
+)
+hw_label = "GPU (CUDA)" if torch.cuda.is_available() else "CPU (Sequential Lazy-Load)"
+st.sidebar.caption(f"Compute Mode: `{hw_label}`")
+
+st.sidebar.markdown("---")
 if not is_locked:
     if st.sidebar.button(
         "🔒 Lock Settings & Run", use_container_width=True, type="primary"
@@ -1315,8 +1463,11 @@ if not is_locked:
         st.session_state["applied_settings"] = {
             "detector_backend": sel_backend,
             "min_confidence": sel_confidence,
-            "output_size": sel_size,
+            "output_size": FIXED_ALIGNED_FACE_SIZE,
             "max_frames": sel_max_frames,
+            "enable_module4": sel_m4_enabled,
+            "m4_auto_download": sel_m4_auto_download,
+            "m4_gradcam": sel_m4_gradcam,
         }
         st.session_state["settings_locked"] = True
         st.session_state.pop("m2_cache_key", None)
@@ -1327,6 +1478,7 @@ else:
         st.session_state["settings_locked"] = False
         st.session_state["m2_result"] = None
         st.session_state["m3_result"] = None
+        st.session_state["m4_result"] = None
         st.session_state.pop("m2_cache_key", None)
         st.session_state.pop("m2_frame_record_paths", None)
         st.rerun()
@@ -1364,6 +1516,7 @@ if uploaded_file is not None:
         st.session_state.pop("m2_cache_key", None)
         st.session_state["m2_result"] = None
         st.session_state["m3_result"] = None
+        st.session_state["m4_result"] = None
 
     file_path = st.session_state["active_raw_path"]
     original_stem = Path(uploaded_file.name).stem
@@ -1405,7 +1558,7 @@ if uploaded_file is not None:
                 st.write(metadata)
 
     # =====================================================
-    # MODULE 2 & MODULE 3 EXECUTION (LOCKED)
+    # MODULE 2, MODULE 3 & MODULE 4 EXECUTION (LOCKED)
     # =====================================================
     st.divider()
     st.header("🟡 Module 2: Frame Extraction & Face Finding")
@@ -1417,14 +1570,17 @@ if uploaded_file is not None:
         )
     else:
         active_cfg = st.session_state["applied_settings"]
+        registered_ids = ",".join(d["detector_id"] for d in list_available_detectors())
         cache_key = (
             f"{file_sha[:8]}_{active_cfg['detector_backend']}_{active_cfg['min_confidence']:.2f}_"
-            f"{active_cfg['output_size']}_{active_cfg['max_frames']}_m3v8"
+            f"{FIXED_ALIGNED_FACE_SIZE}_{active_cfg['max_frames']}_m3v8_"
+            f"m4_{int(active_cfg['enable_module4'])}_{int(active_cfg['m4_auto_download'])}_"
+            f"{int(active_cfg['m4_gradcam'])}_{registered_ids}"
         )
 
         if st.session_state.get("m2_cache_key") != cache_key:
             with st.spinner(
-                "Extracting frames, locating faces, and running Module 3 signal checks..."
+                "Extracting frames, locating faces, and running Module 3 & Module 4 checks..."
             ):
                 try:
                     short_case_id = _unique_timestamped_name(PROCESSED_ROOT, original_stem)
@@ -1432,7 +1588,7 @@ if uploaded_file is not None:
                         input_path=file_path,
                         processed_root=str(PROCESSED_ROOT),
                         case_id=short_case_id,
-                        output_size=(active_cfg["output_size"], active_cfg["output_size"]),
+                        output_size=(FIXED_ALIGNED_FACE_SIZE, FIXED_ALIGNED_FACE_SIZE),
                         max_frames=active_cfg["max_frames"],
                         min_confidence=active_cfg["min_confidence"],
                         backend=active_cfg["detector_backend"],
@@ -1440,21 +1596,42 @@ if uploaded_file is not None:
                     )
                     frame_record_paths = _save_module2_json_records(m2_res)
                     m3_res = _run_module3_on_raw_frames(m2_res)
+
+                    m4_res = None
+                    m4_err = None
+                    if active_cfg.get("enable_module4", True):
+                        try:
+                            m4_res = run_module4(
+                                m2_manifest=m2_res,
+                                device="auto",
+                                auto_download=bool(active_cfg.get("m4_auto_download", True)),
+                                batch_size=4,
+                                enable_gradcam=bool(active_cfg.get("m4_gradcam", True)),
+                            )
+                        except Exception as exc_m4:
+                            m4_err = str(exc_m4)
+
                     st.session_state["m2_cache_key"] = cache_key
                     st.session_state["m2_result"] = m2_res
                     st.session_state["m2_frame_record_paths"] = frame_record_paths
                     st.session_state["m3_result"] = m3_res
+                    st.session_state["m4_result"] = m4_res
+                    st.session_state["m4_error"] = m4_err
                     st.session_state["m2_error"] = None
                 except Exception as exc:
                     st.session_state["m2_cache_key"] = cache_key
                     st.session_state["m2_result"] = None
                     st.session_state["m2_frame_record_paths"] = {}
                     st.session_state["m3_result"] = None
+                    st.session_state["m4_result"] = None
+                    st.session_state["m4_error"] = None
                     st.session_state["m2_error"] = str(exc)
 
         m2_res = st.session_state.get("m2_result")
         m3_res = st.session_state.get("m3_result")
+        m4_res = st.session_state.get("m4_result")
         m2_err = st.session_state.get("m2_error")
+        m4_err = st.session_state.get("m4_error")
         frame_record_paths = st.session_state.get("m2_frame_record_paths", {})
 
         if m2_err:
@@ -1758,12 +1935,8 @@ if uploaded_file is not None:
                     elif m3_mode == m3_modes[4]:
                         _render_module3_frame_record(current_m3)
 
-                # =============================================
-                # MODULE 3 AUDIT SUMMARY & OVERALL VERDICT
-                # =============================================
                 st.divider()
                 st.subheader("📋 Module 3 Overall Summary")
-
                 _render_verdict_and_details(
                     m3_res.get("interpretation"),
                     verdict_title="Overall Module 3 Verdict",
@@ -1801,6 +1974,168 @@ if uploaded_file is not None:
                             ],
                         }
                     )
+
+            # =================================================
+            # MODULE 4: DEEP LEARNING & GRAD-CAM XAI
+            # =================================================
+            if active_cfg.get("enable_module4", True):
+                st.divider()
+                st.header("🔵 Module 4: Deep Learning & Explainable AI (Grad-CAM)")
+                st.caption(
+                    "Runs registered AI deepfake detectors sequentially (Sequential Lazy-Loading) "
+                    "and generates Grad-CAM heatmaps over aligned 256×256 faces."
+                )
+
+                if m4_err:
+                    st.error(f"Module 4 Execution Error: {m4_err}")
+                elif m4_res:
+                    det_exec = m4_res.get("detectors_executed", []) or []
+                    det_skip = m4_res.get("detectors_skipped", []) or []
+                    det_sums = m4_res.get("detector_summaries", {}) or {}
+                    m4_sum = m4_res.get("execution_summary", {}) or {}
+                    m4_frames = m4_res.get("frames_detail", []) or []
+                    is_multi_m4 = len(m4_frames) > 1
+
+                    if det_skip:
+                        skip_msg = " | ".join(
+                            f"**{d['detector_id']}**: {d['reason']}" for d in det_skip
+                        )
+                        st.warning(f"⚠️ Some Module 4 detectors were skipped: {skip_msg}")
+
+                    if det_exec:
+                        eval_m4_frames = [f for f in m4_frames if f.get("evaluated")]
+                        if is_multi_m4 and eval_m4_frames:
+                            peak_m4 = max(
+                                eval_m4_frames,
+                                key=lambda f: float(f.get("ensemble_fake_probability") or 0.0),
+                            )
+                            m4_sub = (
+                                f"Frame #{peak_m4['frame_index']} has the highest AI suspicion "
+                                f"({float(peak_m4['ensemble_fake_probability']) * 100:.0f}%)."
+                            )
+                        elif len(eval_m4_frames) == 1:
+                            m4_sub = (
+                                f"Evaluated 1 frame ({Path(eval_m4_frames[0]['frame_path']).name})."
+                            )
+                        else:
+                            m4_sub = "No aligned faces were available to evaluate."
+
+                        _render_suspicion_box(
+                            title="Module 4 AI Suspicion",
+                            severity=m4_sum["overall_suspicion"],
+                            score=m4_sum["max_module4_score"],
+                            subtitle=m4_sub,
+                        )
+
+                        kpi_cols = st.columns(1 + len(det_exec))
+                        kpi_cols[0].metric(
+                            "Frames Evaluated",
+                            f"{m4_sum['frames_evaluated']}/{m4_sum['frames_total']}",
+                        )
+                        for idx_d, det_id in enumerate(det_exec):
+                            ds = det_sums[det_id]
+                            _render_m3_kpi(
+                                kpi_cols[1 + idx_d],
+                                ds.get("display_name", det_id.upper()),
+                                float(ds["mean_fake_probability"]),
+                                float(ds["max_fake_probability"]),
+                                is_multi_m4,
+                            )
+
+                        if m4_frames:
+                            st.markdown("---")
+                            if len(m4_frames) > 1:
+                                m4_c1, m4_c2 = st.columns([2, 5])
+                                with m4_c1:
+                                    st.markdown("#### 🎞️ Pick a Frame to Inspect (AI)")
+                                with m4_c2:
+                                    m4_frame_idx = st.slider(
+                                        "Target Frame (Module 4)",
+                                        min_value=1,
+                                        max_value=len(m4_frames),
+                                        value=1,
+                                        step=1,
+                                        format="Frame #%d",
+                                        key="m4_frame_slider",
+                                        label_visibility="collapsed",
+                                    )
+                            else:
+                                m4_frame_idx = 1
+
+                            current_m4 = m4_frames[m4_frame_idx - 1]
+                            _render_m4_frame_status_box(m4_frame_idx, current_m4, det_sums)
+
+                            if len(det_exec) > 1:
+                                det_labels = [
+                                    det_sums[d].get("display_name", d.upper()) for d in det_exec
+                                ]
+                                if hasattr(st, "segmented_control"):
+                                    sel_det_label = st.segmented_control(
+                                        "AI Detector:",
+                                        options=det_labels,
+                                        default=det_labels[0],
+                                        key="m4_det_selector",
+                                        label_visibility="collapsed",
+                                    )
+                                else:
+                                    sel_det_label = st.radio(
+                                        "AI Detector:",
+                                        options=det_labels,
+                                        index=0,
+                                        horizontal=True,
+                                        key="m4_det_selector",
+                                        label_visibility="collapsed",
+                                    )
+                                active_det_id = det_exec[det_labels.index(sel_det_label)]
+                            else:
+                                active_det_id = det_exec[0]
+
+                            _render_module4_detector_frame(
+                                det_id=active_det_id,
+                                det_summary=det_sums[active_det_id],
+                                det_frame=current_m4["detectors"][active_det_id],
+                                det_translation=current_m4.get("interpretation", {}).get(
+                                    active_det_id
+                                ),
+                            )
+
+                        st.divider()
+                        st.subheader("📋 Module 4 Overall Summary")
+                        _render_verdict_and_details(
+                            m4_res.get("interpretation"),
+                            verdict_title="Overall Module 4 Verdict",
+                            expander_label="📖 See AI detector breakdown & notable frames",
+                        )
+
+                        with st.expander(
+                            "🗂️ Technical Module 4 Audit Metadata & Weights", expanded=False
+                        ):
+                            st.table(
+                                {
+                                    "Module 4 Property": [
+                                        "Case ID",
+                                        "Execution Mode",
+                                        "Device Target",
+                                        "Detectors Executed",
+                                        "Mean / Max / Top-30% AI Score",
+                                        "Overall Module 4 Suspicion",
+                                        "Weights Cache Directory",
+                                        "Module 4 Manifest File",
+                                    ],
+                                    "Observed Value": [
+                                        m4_res["forensics_metadata"]["case_id"],
+                                        m4_res["module4_settings"]["execution_mode"],
+                                        m4_res["module4_settings"]["device_target"],
+                                        ", ".join(det_exec),
+                                        f"{m4_sum['mean_module4_score']:.4f} / "
+                                        f"{m4_sum['max_module4_score']:.4f} / "
+                                        f"{m4_sum['topk_module4_score']:.4f}",
+                                        str(m4_sum["overall_suspicion"]).upper(),
+                                        get_cache_dir(),
+                                        m4_res["artifacts_directory"]["manifest"],
+                                    ],
+                                }
+                            )
 else:
     st.info(
         "👈 Adjust settings on the left sidebar, click 'Lock Settings & Run', and upload a photo or video to begin."

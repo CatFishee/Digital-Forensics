@@ -48,7 +48,7 @@ def run_module2(
     input_path: str,
     processed_root: str = "data/processed",
     case_id: Optional[str] = None,
-    output_size: Tuple[int, int] = (299, 299),
+    output_size: Tuple[int, int] = (256, 256),
     max_frames: Optional[int] = 10,
     min_confidence: float = 0.80,
     backend: str = "retinaface",
@@ -58,7 +58,7 @@ def run_module2(
     Pipeline Module 2: Preprocessing & ROI Extraction
     - Extracts evenly spaced non-blank moments (exact requested count when available).
     - Extracts short consecutive frame bursts for video temporal analysis.
-    - Aligns faces on primary moments and records lightweight landmarks on burst frames.
+    - Aligns faces on primary moments (256x256) and records lightweight landmarks on burst frames.
     """
     src = Path(input_path)
     folder_name = case_id or src.stem
