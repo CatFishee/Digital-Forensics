@@ -27,7 +27,12 @@ from src.module_3 import (
     NoiseAnalyzer,
     TemporalAnalyzer,
 )
-from src.module_4 import get_cache_dir, list_available_detectors, run_module4
+from src.module_4 import (
+    get_cache_dir,
+    get_required_crop_specs,
+    list_available_detectors,
+    run_module4,
+)
 
 TEMP_DIR = Path("data/raw")
 PREVIEW_DIR = TEMP_DIR / "_previews"
@@ -252,7 +257,6 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             {"burst_index": 0, "frame_path": frame_path, "faces": faces}
         ]
 
-        # 1. Face-Boundary Blending & Chrominance Mismatch
         boundary_res = boundary_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(boundary_dir),
@@ -260,14 +264,12 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             prefix=frame_stem,
         )
 
-        # 2. Multi-Face Temporal Face Flicker & Inter-Frame Consistency
         temporal_res = temporal_analyzer.analyze(
             burst_frames=burst_frames,
             output_dir=str(temporal_dir),
             prefix=frame_stem,
         )
 
-        # 3. SRM Noise Residual Analysis
         noise_res = noise_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(noise_dir),
@@ -275,7 +277,6 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             prefix=frame_stem,
         )
 
-        # 4. Full-frame 2D-FFT
         full_fft_res = fft_analyzer.analyze(
             image_path=frame_path,
             output_dir=str(fft_dir),
@@ -284,7 +285,6 @@ def _run_module3_on_raw_frames(m2_res: dict) -> dict:
             trim_borders=True,
         )
 
-        # 5. Unwarped raw face bbox 2D-FFT
         face_raw_ffts: list[dict] = []
         if faces:
             raw_bgr = _imread_unicode(Path(frame_path))
@@ -747,7 +747,8 @@ def _render_frame_forensic_record(
                 "Detector": [],
                 "Confidence": [],
                 "Box [X1, Y1, X2, Y2]": [],
-                "Cropped Size": [],
+                "Display Crop": [],
+                "Model Crops": [],
             }
             for f_info in faces:
                 bbox = f_info.get("bbox", [0, 0, 0, 0])
@@ -757,6 +758,15 @@ def _render_frame_forensic_record(
                     if isinstance(aligned_sz, (list, tuple)) and len(aligned_sz) >= 2
                     else "N/A"
                 )
+                mc = f_info.get("model_crops") or {}
+                mc_str = (
+                    ", ".join(
+                        f"{sid} ({c['output_size'][0]}x{c['output_size'][1]})"
+                        for sid, c in mc.items()
+                    )
+                    if mc
+                    else "None"
+                )
                 face_label = f_info.get("global_face_id") or f"Face #{f_info.get('face_index', 0)}"
                 summary_rows["Face ID"].append(face_label)
                 summary_rows["Detector"].append(str(f_info.get("detector", "N/A")).upper())
@@ -764,7 +774,8 @@ def _render_frame_forensic_record(
                 summary_rows["Box [X1, Y1, X2, Y2]"].append(
                     f"[{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]" if len(bbox) >= 4 else "N/A"
                 )
-                summary_rows["Cropped Size"].append(aligned_str)
+                summary_rows["Display Crop"].append(aligned_str)
+                summary_rows["Model Crops"].append(mc_str)
             st.table(summary_rows)
 
 
@@ -1205,12 +1216,13 @@ def _render_module4_detector_frame(
     det_frame: dict,
     det_translation: dict | None,
 ) -> None:
-    """Render one Module 4 detector's per-face aligned crop + Grad-CAM overlay + verdict."""
+    """Render one Module 4 detector's per-face model-native crop + Grad-CAM overlay + verdict."""
     display_name = det_summary.get("display_name", det_id.upper())
+    default_sz = det_summary.get("input_size", FIXED_ALIGNED_FACE_SIZE)
     st.markdown(f"##### 🧠 {display_name}")
 
     if not det_frame.get("evaluated"):
-        st.info("No aligned face was detected in this frame to evaluate.")
+        st.info("No face was detected in this frame to evaluate.")
         _render_verdict_and_details(det_translation, verdict_title=f"{display_name} Verdict")
         return
 
@@ -1221,17 +1233,28 @@ def _render_module4_detector_frame(
         f_label, f_icon, _ = _suspicion_display(f_sev, f_prob)
         pred_tag = f_res.get("prediction_label", "REAL")
 
+        crop_path = f_res.get("input_crop_path") or f_res.get("aligned_face_path")
+        out_sz = f_res.get("input_size") or [default_sz, default_sz]
+        if isinstance(out_sz, (list, tuple)) and len(out_sz) >= 2:
+            sz_label = f"{out_sz[0]}x{out_sz[1]}"
+        else:
+            sz_label = f"{default_sz}x{default_sz}"
+
+        unreliable = bool(f_res.get("unreliable_pose_warning", False)) or (
+            float(f_res.get("padded_ratio", 0.0)) > 0.15
+        )
+        warn_suffix = " — *⚠️ Edge-clipped or extreme angle*" if unreliable else ""
+
         with st.container(border=True):
             st.markdown(
-                f"**{f_gid}** — Fake Probability: {f_icon} `{f_label}` | Prediction: `{pred_tag}`"
+                f"**{f_gid}** — Fake Probability: {f_icon} `{f_label}` | Prediction: `{pred_tag}`{warn_suffix}"
             )
             c_face, c_cam, c_info = st.columns([1.0, 1.0, 1.2])
             with c_face:
-                al_p = f_res.get("aligned_face_path")
-                if al_p and os.path.exists(al_p):
+                if crop_path and os.path.exists(crop_path):
                     st.image(
-                        al_p,
-                        caption=f"Aligned Face Input ({FIXED_ALIGNED_FACE_SIZE}x{FIXED_ALIGNED_FACE_SIZE})",
+                        crop_path,
+                        caption=f"Model Input Crop ({sz_label})",
                         use_container_width=True,
                     )
             with c_cam:
@@ -1269,6 +1292,7 @@ def _render_module4_detector_frame(
             "P(Real)": [],
             "P(Fake)": [],
             "Logit (Real / Fake)": [],
+            "Padded Ratio": [],
             "Grad-CAM Path": [],
         }
         for f_res in det_frame.get("faces", []) or []:
@@ -1279,6 +1303,7 @@ def _render_module4_detector_frame(
             rows["Logit (Real / Fake)"].append(
                 f"{logits.get('real', 'N/A')} / {logits.get('fake', 'N/A')}"
             )
+            rows["Padded Ratio"].append(f"{float(f_res.get('padded_ratio', 0.0)) * 100:.1f}%")
             rows["Grad-CAM Path"].append(f_res.get("gradcam_overlay_path") or "N/A")
         st.table(rows)
 
@@ -1418,7 +1443,8 @@ sel_confidence = st.sidebar.slider(
 )
 
 st.sidebar.caption(
-    f"📐 **Aligned Face Output:** Fixed at `{FIXED_ALIGNED_FACE_SIZE} × {FIXED_ALIGNED_FACE_SIZE}` px"
+    f"📐 **Display Face Crop:** `{FIXED_ALIGNED_FACE_SIZE} × {FIXED_ALIGNED_FACE_SIZE}` px "
+    "(plus native crops per active Module 4 model)"
 )
 
 sel_max_frames = st.sidebar.slider(
@@ -1445,7 +1471,7 @@ sel_m4_auto_download = st.sidebar.checkbox(
     "Auto-download missing AI weights",
     value=bool(current_cfg.get("m4_auto_download", True)),
     disabled=is_locked or not sel_m4_enabled,
-    help=f"Caches verified checkpoints in `{get_cache_dir()}` (same pattern as Module 2).",
+    help=f"Caches verified checkpoints in `{get_cache_dir()}`.",
 )
 sel_m4_gradcam = st.sidebar.checkbox(
     "Generate Grad-CAM heatmaps (XAI)",
@@ -1570,10 +1596,16 @@ if uploaded_file is not None:
         )
     else:
         active_cfg = st.session_state["applied_settings"]
+        crop_specs = (
+            get_required_crop_specs() if active_cfg.get("enable_module4", True) else []
+        )
         registered_ids = ",".join(d["detector_id"] for d in list_available_detectors())
+        crop_sig = hashlib.md5(
+            json.dumps(crop_specs, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:6]
         cache_key = (
             f"{file_sha[:8]}_{active_cfg['detector_backend']}_{active_cfg['min_confidence']:.2f}_"
-            f"{FIXED_ALIGNED_FACE_SIZE}_{active_cfg['max_frames']}_m3v8_"
+            f"{FIXED_ALIGNED_FACE_SIZE}_{active_cfg['max_frames']}_m2v2_{crop_sig}_m3v8_"
             f"m4_{int(active_cfg['enable_module4'])}_{int(active_cfg['m4_auto_download'])}_"
             f"{int(active_cfg['m4_gradcam'])}_{registered_ids}"
         )
@@ -1593,6 +1625,8 @@ if uploaded_file is not None:
                         min_confidence=active_cfg["min_confidence"],
                         backend=active_cfg["detector_backend"],
                         burst_length=5,
+                        border_mode="replicate",
+                        crop_specs=crop_specs,
                     )
                     frame_record_paths = _save_module2_json_records(m2_res)
                     m3_res = _run_module3_on_raw_frames(m2_res)
@@ -1720,11 +1754,27 @@ if uploaded_file is not None:
                                 )
                             with c_info:
                                 st.markdown("##### 📌 Face Crop Info")
+                                model_crops = f_info.get("model_crops") or {}
+                                crops_summary = (
+                                    ", ".join(
+                                        f"`{sid}` ({c['output_size'][0]}×{c['output_size'][1]}, {c['crop_mode']})"
+                                        for sid, c in model_crops.items()
+                                    )
+                                    if model_crops
+                                    else "`Display crop only`"
+                                )
+                                pose_warn = (
+                                    "⚠️ Yes (Edge-clipped or extreme angle)"
+                                    if f_info.get("unreliable_pose_warning")
+                                    else "No"
+                                )
                                 st.markdown(
                                     f"""
                                     - **Face ID:** `{f_info.get('global_face_id', 'Face')}`
                                     - **Match Confidence:** `{f_info['confidence'] * 100:.1f}%`
-                                    - **Standardized Crop Size:** `{f_info['aligned_size'][0]} x {f_info['aligned_size'][1]} px`
+                                    - **Display Crop Size:** `{f_info['aligned_size'][0]} x {f_info['aligned_size'][1]} px`
+                                    - **Model-Native Crops:** {crops_summary}
+                                    - **Pose / Clipping Warning:** {pose_warn} (`{float(f_info.get('padded_ratio', 0.0)) * 100:.1f}%` padded)
                                     - **Face Location Box:** `[{f_info['bbox'][0]}, {f_info['bbox'][1]}, {f_info['bbox'][2]}, {f_info['bbox'][3]}]`
                                     """
                                 )
@@ -1764,6 +1814,14 @@ if uploaded_file is not None:
             st.divider()
             st.subheader("📋 Frame Extraction Summary")
             with st.expander("🗂️ Technical Preprocessing Details", expanded=False):
+                prep_cfg = m2_res["preprocessing_settings"]
+                spec_desc = (
+                    ", ".join(
+                        f"{s['spec_id']} ({s['output_size'][0]}x{s['output_size'][1]} {s['crop_mode']})"
+                        for s in (prep_cfg.get("model_crop_specs") or [])
+                    )
+                    or "None"
+                )
                 st.table(
                     {
                         "Property": [
@@ -1772,7 +1830,9 @@ if uploaded_file is not None:
                             "Media Type",
                             "Face Finder",
                             "Sampling Mode",
-                            "Cropped Face Size",
+                            "Display Crop Size",
+                            "Border Padding Mode",
+                            "Model Crop Specs",
                             "Frames Extracted",
                             "Blank Frames Skipped",
                             "Total Faces Cropped",
@@ -1782,9 +1842,11 @@ if uploaded_file is not None:
                             m2_res["forensics_metadata"]["case_id"],
                             m2_res["forensics_metadata"]["timestamp"],
                             m2_res["forensics_metadata"]["media_type"],
-                            m2_res["preprocessing_settings"]["ai_detector"],
-                            m2_res["preprocessing_settings"]["sampling_mode"],
-                            m2_res["preprocessing_settings"]["canonical_resolution"],
+                            prep_cfg["ai_detector"],
+                            prep_cfg["sampling_mode"],
+                            prep_cfg["canonical_resolution"],
+                            prep_cfg.get("border_mode", "replicate"),
+                            spec_desc,
                             str(exec_sum["final_frames_analyzed"]),
                             str(exec_sum["discarded_blank_or_extreme_frames"]),
                             str(exec_sum["total_faces_extracted"]),
@@ -1983,7 +2045,7 @@ if uploaded_file is not None:
                 st.header("🔵 Module 4: Deep Learning & Explainable AI (Grad-CAM)")
                 st.caption(
                     "Runs registered AI deepfake detectors sequentially (Sequential Lazy-Loading) "
-                    "and generates Grad-CAM heatmaps over aligned 256×256 faces."
+                    "on model-native face crops exported by Module 2 and generates Grad-CAM heatmaps."
                 )
 
                 if m4_err:
@@ -2002,7 +2064,12 @@ if uploaded_file is not None:
                         )
                         st.warning(f"⚠️ Some Module 4 detectors were skipped: {skip_msg}")
 
-                    if det_exec:
+                    if not det_exec:
+                        m4_interp = m4_res.get("interpretation", {}) or {}
+                        st.info(
+                            f"ℹ️ **{m4_interp.get('headline', 'No Module 4 detectors are currently active.')}**"
+                        )
+                    else:
                         eval_m4_frames = [f for f in m4_frames if f.get("evaluated")]
                         if is_multi_m4 and eval_m4_frames:
                             peak_m4 = max(
@@ -2010,20 +2077,28 @@ if uploaded_file is not None:
                                 key=lambda f: float(f.get("ensemble_fake_probability") or 0.0),
                             )
                             m4_sub = (
-                                f"Frame #{peak_m4['frame_index']} has the highest AI suspicion "
-                                f"({float(peak_m4['ensemble_fake_probability']) * 100:.0f}%)."
+                                f"Video average across {len(eval_m4_frames)} evaluated frames; "
+                                f"Frame #{peak_m4['frame_index']} peaked at "
+                                f"{float(peak_m4['ensemble_fake_probability']) * 100:.0f}%."
                             )
                         elif len(eval_m4_frames) == 1:
                             m4_sub = (
                                 f"Evaluated 1 frame ({Path(eval_m4_frames[0]['frame_path']).name})."
                             )
                         else:
-                            m4_sub = "No aligned faces were available to evaluate."
+                            m4_sub = "No faces were available to evaluate."
+
+                        primary_m4 = float(
+                            m4_sum.get(
+                                "primary_module4_score",
+                                m4_sum.get("mean_module4_score", m4_sum.get("max_module4_score", 0.0)),
+                            )
+                        )
 
                         _render_suspicion_box(
                             title="Module 4 AI Suspicion",
                             severity=m4_sum["overall_suspicion"],
-                            score=m4_sum["max_module4_score"],
+                            score=primary_m4,
                             subtitle=m4_sub,
                         )
 
@@ -2115,6 +2190,7 @@ if uploaded_file is not None:
                                     "Module 4 Property": [
                                         "Case ID",
                                         "Execution Mode",
+                                        "Case Aggregation",
                                         "Device Target",
                                         "Detectors Executed",
                                         "Mean / Max / Top-30% AI Score",
@@ -2125,8 +2201,9 @@ if uploaded_file is not None:
                                     "Observed Value": [
                                         m4_res["forensics_metadata"]["case_id"],
                                         m4_res["module4_settings"]["execution_mode"],
+                                        m4_res["module4_settings"].get("case_aggregation", "mean"),
                                         m4_res["module4_settings"]["device_target"],
-                                        ", ".join(det_exec),
+                                        ", ".join(det_exec) if det_exec else "None",
                                         f"{m4_sum['mean_module4_score']:.4f} / "
                                         f"{m4_sum['max_module4_score']:.4f} / "
                                         f"{m4_sum['topk_module4_score']:.4f}",

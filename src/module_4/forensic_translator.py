@@ -32,7 +32,7 @@ class Module4ForensicTranslator:
                     {
                         "title": "No Face Available",
                         "severity": "info",
-                        "detail": "Face-based AI detectors require at least one aligned face from Module 2.",
+                        "detail": "Face-based AI detectors require at least one detected face from Module 2.",
                     }
                 ],
                 "user_guidance": "Inspect a frame where a face is clearly detected.",
@@ -57,10 +57,29 @@ class Module4ForensicTranslator:
             )
         else:
             headline = (
-                f"{level} ({pct}) — {display_name} found the face frequency patterns consistent with real media."
+                f"{level} ({pct}) — {display_name} found the face patterns consistent with real media."
             )
 
         findings: List[Dict[str, str]] = []
+
+        unreliable_faces = [
+            f.get("global_face_id", "Face")
+            for f in faces
+            if f.get("unreliable_pose_warning") or float(f.get("padded_ratio", 0.0)) > 0.15
+        ]
+        if unreliable_faces:
+            findings.append(
+                {
+                    "title": "Edge-Clipped or Extreme Angle Face",
+                    "severity": "warning",
+                    "detail": (
+                        f"Face crop(s) for {', '.join(unreliable_faces)} were partially outside the frame "
+                        "or at an extreme side profile. Raise the Confidence Threshold or inspect the crop "
+                        "image closely, as heavy edge padding or extreme angles reduce reliability."
+                    ),
+                }
+            )
+
         if len(faces) > 1:
             parts = [
                 f"{f.get('global_face_id', 'Face')}: {self._pct(f['fake_probability'])}"
@@ -112,17 +131,25 @@ class Module4ForensicTranslator:
         frames = m4_manifest.get("frames_detail", []) or []
 
         if not detectors_active:
+            if detectors_skipped:
+                headline = "No Module 4 AI detectors could run (missing checkpoints or load error)."
+                detail = ", ".join(
+                    f"{d['detector_id']} ({d['reason']})" for d in detectors_skipped
+                )
+            else:
+                headline = "No Module 4 AI detectors are currently registered/active."
+                detail = (
+                    "Register a detector in `src/module_4/runner.py` (`DETECTOR_REGISTRY`) "
+                    "to enable deep learning inference and Grad-CAM."
+                )
             return {
-                "headline": "No Module 4 AI detectors could run (missing checkpoints or disabled).",
+                "headline": headline,
                 "severity": "low",
                 "findings": [
                     {
-                        "title": "Skipped Detectors",
-                        "severity": "warning",
-                        "detail": ", ".join(
-                            f"{d['detector_id']} ({d['reason']})" for d in detectors_skipped
-                        )
-                        or "None configured.",
+                        "title": "Module 4 Status",
+                        "severity": "info" if not detectors_skipped else "warning",
+                        "detail": detail,
                     }
                 ],
                 "peak_frames": [],
@@ -130,24 +157,31 @@ class Module4ForensicTranslator:
             }
 
         overall_sev = str(exec_sum.get("overall_suspicion", "low")).lower()
+        primary_score = float(
+            exec_sum.get(
+                "primary_module4_score",
+                exec_sum.get("mean_module4_score", exec_sum.get("max_module4_score", 0.0)),
+            )
+        )
         max_score = float(exec_sum.get("max_module4_score", 0.0))
         mean_score = float(exec_sum.get("mean_module4_score", 0.0))
         level = self._friendly_level(overall_sev)
+        primary_pct = self._pct(primary_score)
         peak_pct = self._pct(max_score)
 
         if overall_sev == "high":
             headline = (
-                f"{level} ({peak_pct}) — Deep learning analysis detected strong AI manipulation "
+                f"{level} ({primary_pct}) — Deep learning analysis detected strong AI manipulation "
                 "indicators in this media."
             )
         elif overall_sev == "medium":
             headline = (
-                f"{level} ({peak_pct}) — Deep learning models flagged moderate suspicion. "
+                f"{level} ({primary_pct}) — Deep learning models flagged moderate suspicion. "
                 "Review the Grad-CAM overlays and Module 3 signal clues together."
             )
         else:
             headline = (
-                f"{level} ({peak_pct}) — Active deep learning detector(s) scored this media as likely real."
+                f"{level} ({primary_pct}) — Active deep learning detector(s) scored this media as likely real."
             )
 
         findings: List[Dict[str, str]] = []
@@ -159,7 +193,7 @@ class Module4ForensicTranslator:
                     "severity": "info",
                     "detail": (
                         f"Evaluated {len(eval_frames)}/{len(frames)} frames with faces "
-                        f"(average peak score: {self._pct(mean_score)}, highest frame score: {peak_pct})."
+                        f"(video average: {self._pct(mean_score)}, highest single frame: {peak_pct})."
                     ),
                 }
             )

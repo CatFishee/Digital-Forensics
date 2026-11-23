@@ -11,6 +11,7 @@ numpy>=2.0.0,<3.0.0
 Pillow>=10.3.0
 PyYAML>=6.0.1
 tqdm>=4.66.0
+requests>=2.31.0
 
 # --- Module 1: Ingestion, Chain of Custody & File Forensics (EXIF, DQT) ---
 PyExifTool==0.5.6
@@ -23,15 +24,19 @@ opencv-python>=4.11.0
 # Mặc định dùng RetinaFace qua UniFace (nếu dùng GPU ONNX đổi thành uniface[gpu])
 uniface[cpu]>=2.0.0
 
-# --- Module 3: Pixel-level Forensics (ELA & 2D-FFT) ---
+# --- Module 3: Pixel-level Forensics (Noise, Boundary, Temporal & 2D-FFT) ---
 scipy>=1.14.0
 scikit-image>=0.25.0
 
-# --- Module 4: Deep Learning (DeepfakeBench: Xception, SBI, F3Net) & XAI ---
+# --- Module 4: Deep Learning & XAI ---
 timm>=1.0.0
 efficientnet-pytorch>=0.7.1
 grad-cam>=1.5.5
 scikit-learn>=1.5.0
+transformers>=4.45.0
+huggingface-hub>=0.25.0
+safetensors>=0.4.5
+accelerate>=0.34.0
 
 # --- Module 5: Decision Fusion, Dashboard UI & PDF Forensic Report ---
 streamlit>=1.38.0

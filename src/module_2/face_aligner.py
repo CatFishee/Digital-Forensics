@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
@@ -17,6 +17,9 @@ CANONICAL_LANDMARKS_112 = np.array(
     ],
     dtype=np.float32,
 )
+
+# BGR equivalent of CLIP RGB mean [123, 117, 104]
+CLIP_MEAN_BGR = (104, 117, 123)
 
 
 def _imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -75,25 +78,66 @@ def _is_valid_face_geometry(
     return True
 
 
+def _is_clipped_or_extreme_profile(
+    box: np.ndarray, pts: np.ndarray, img_w: int, img_h: int
+) -> bool:
+    """Flag faces touching frame borders or turned into extreme side profiles."""
+    x1, y1, x2, y2 = [float(v) for v in box[:4]]
+    bw = max(x2 - x1, 1.0)
+
+    if x1 < -2.0 or y1 < -2.0 or x2 > (img_w + 2.0) or y2 > (img_h + 2.0):
+        return True
+
+    for lx, ly in pts:
+        if lx < 0.0 or lx > img_w or ly < 0.0 or ly > img_h:
+            return True
+
+    left_eye, right_eye, nose = pts[0], pts[1], pts[2]
+    eye_dx = abs(float(right_eye[0]) - float(left_eye[0]))
+    min_ex = min(float(left_eye[0]), float(right_eye[0]))
+    max_ex = max(float(left_eye[0]), float(right_eye[0]))
+    nose_x = float(nose[0])
+
+    if eye_dx < 0.24 * bw or nose_x < (min_ex - 0.05 * bw) or nose_x > (max_ex + 0.05 * bw):
+        return True
+
+    return False
+
+
+def _resolve_cv_border(border_mode: str) -> Tuple[int, Tuple[int, int, int]]:
+    mode = str(border_mode or "replicate").lower()
+    if mode == "constant_black":
+        return cv2.BORDER_CONSTANT, (0, 0, 0)
+    if mode == "constant_clip_mean":
+        return cv2.BORDER_CONSTANT, CLIP_MEAN_BGR
+    if mode == "reflect101":
+        return cv2.BORDER_REFLECT_101, (0, 0, 0)
+    return cv2.BORDER_REPLICATE, (0, 0, 0)
+
+
 class FaceAligner:
     """
-    Module 2.2 & 2.3: Face Localization (RetinaFace / MTCNN) & Affine Transformation
+    Module 2.2 & 2.3: Face Localization (RetinaFace / MTCNN) & Single-Pass Multi-Spec Cropping.
+    Generates both the canonical display crop and exact model-native crops directly
+    from the unedited raw frame without double interpolation.
     """
 
     def __init__(
         self,
         backend: str = "retinaface",
-        output_size: Tuple[int, int] = (299, 299),
+        output_size: Tuple[int, int] = (256, 256),
         min_face_size: int = 60,
         min_confidence: float = 0.80,
         margin_scale: float = 0.85,
+        border_mode: str = "replicate",
         device: Optional[str] = None,
     ):
         self.backend = backend.lower()
-        self.output_size = output_size
+        self.output_size = (int(output_size[0]), int(output_size[1]))
         self.min_face_size = min_face_size
         self.min_confidence = min_confidence
         self.margin_scale = margin_scale
+        self.border_mode = border_mode
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
         if self.backend == "retinaface":
@@ -147,59 +191,226 @@ class FaceAligner:
 
         return detections
 
-    def _get_canonical_landmarks(self) -> np.ndarray:
-        out_w, out_h = self.output_size
+    @staticmethod
+    def _get_canonical_landmarks(
+        output_size: Tuple[int, int], margin_scale: float
+    ) -> np.ndarray:
+        out_w, out_h = output_size
         norm_pts = CANONICAL_LANDMARKS_112 / 112.0
-        centered = (norm_pts - np.array([0.5, 0.5], dtype=np.float32)) * self.margin_scale
+        centered = (norm_pts - np.array([0.5, 0.5], dtype=np.float32)) * margin_scale
         shifted = centered + np.array([0.5, 0.48], dtype=np.float32)
         shifted[:, 0] *= out_w
         shifted[:, 1] *= out_h
         return shifted.astype(np.float32)
 
-    def _align_face(self, img_bgr: np.ndarray, src_landmarks: np.ndarray) -> np.ndarray:
-        dst_landmarks = self._get_canonical_landmarks()
-        src_pts = np.asarray(src_landmarks, dtype=np.float32).reshape(5, 2)
-
-        matrix, _ = cv2.estimateAffinePartial2D(src_pts, dst_landmarks, method=cv2.LMEDS)
+    @staticmethod
+    def _estimate_similarity(
+        src_pts: np.ndarray, dst_pts: np.ndarray
+    ) -> np.ndarray:
+        matrix, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.LMEDS)
         if matrix is None:
-            matrix = cv2.getAffineTransform(src_pts[[0, 1, 3]], dst_landmarks[[0, 1, 3]])
+            matrix = cv2.getAffineTransform(src_pts[[0, 1, 3]], dst_pts[[0, 1, 3]])
+        return matrix
 
-        out_w, out_h = self.output_size
-        # Fill out-of-frame regions with black instead of mirroring facial features
-        return cv2.warpAffine(
+    @classmethod
+    def _build_crop_matrix(
+        cls,
+        box: np.ndarray,
+        src_landmarks: np.ndarray,
+        crop_mode: str,
+        output_size: Tuple[int, int],
+        margin_scale: float,
+        bbox_margin: float,
+    ) -> np.ndarray:
+        """
+        Build a single 2x3 affine transformation matrix directly from raw frame coordinates
+        to the target output dimensions, avoiding any intermediate resizing pass.
+        """
+        out_w, out_h = int(output_size[0]), int(output_size[1])
+        src_pts = np.asarray(src_landmarks, dtype=np.float32).reshape(5, 2)
+        mode = str(crop_mode or "aligned_square").lower()
+
+        if mode == "raw_bbox":
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            side = max(x2 - x1, y2 - y1, 1.0) * float(bbox_margin)
+            x_off = cx - 0.5 * side
+            y_off = cy - 0.5 * side
+            sx = out_w / side
+            sy = out_h / side
+            return np.array(
+                [[sx, 0.0, -x_off * sx], [0.0, sy, -y_off * sy]],
+                dtype=np.float32,
+            )
+
+        if mode == "aligned_bbox_margin":
+            # DeepfakeBench / GenD protocol composed into one single warp:
+            # upright alignment -> aligned bbox enlarged by bbox_margin -> single resize
+            m_upright = cls._estimate_similarity(src_pts, CANONICAL_LANDMARKS_112)
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            corners = np.array(
+                [[x1, y1, 1.0], [x2, y1, 1.0], [x2, y2, 1.0], [x1, y2, 1.0]],
+                dtype=np.float32,
+            )
+            aligned_corners = corners @ m_upright.T
+            ux1, uy1 = aligned_corners.min(axis=0)
+            ux2, uy2 = aligned_corners.max(axis=0)
+            cx = 0.5 * (float(ux1) + float(ux2))
+            cy = 0.5 * (float(uy1) + float(uy2))
+            side = max(float(ux2 - ux1), float(uy2 - uy1), 1.0) * float(bbox_margin)
+
+            x_off = cx - 0.5 * side
+            y_off = cy - 0.5 * side
+            sx = out_w / side
+            sy = out_h / side
+
+            s_mat = np.array(
+                [[sx, 0.0, -x_off * sx], [0.0, sy, -y_off * sy], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            m_upright_3x3 = np.vstack([m_upright, [0.0, 0.0, 1.0]]).astype(np.float32)
+            return (s_mat @ m_upright_3x3)[:2, :]
+
+        # Default: "aligned_square"
+        dst_pts = cls._get_canonical_landmarks((out_w, out_h), float(margin_scale))
+        return cls._estimate_similarity(src_pts, dst_pts)
+
+    @classmethod
+    def _warp_with_metrics(
+        cls,
+        img_bgr: np.ndarray,
+        box: np.ndarray,
+        src_landmarks: np.ndarray,
+        crop_mode: str,
+        output_size: Tuple[int, int],
+        margin_scale: float,
+        bbox_margin: float,
+        border_mode: str,
+    ) -> Tuple[np.ndarray, float]:
+        out_w, out_h = int(output_size[0]), int(output_size[1])
+        matrix = cls._build_crop_matrix(
+            box=box,
+            src_landmarks=src_landmarks,
+            crop_mode=crop_mode,
+            output_size=(out_w, out_h),
+            margin_scale=margin_scale,
+            bbox_margin=bbox_margin,
+        )
+        cv_border, border_val = _resolve_cv_border(border_mode)
+        warped = cv2.warpAffine(
             img_bgr,
             matrix,
             (out_w, out_h),
             flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
+            borderMode=cv_border,
+            borderValue=border_val,
         )
+
+        # Measure exact fraction of output pixels sourced from outside the raw frame
+        h, w = img_bgr.shape[:2]
+        src_mask = np.full((h, w), 255, dtype=np.uint8)
+        warped_mask = cv2.warpAffine(
+            src_mask,
+            matrix,
+            (out_w, out_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        padded_ratio = round(float(np.mean(warped_mask == 0)), 4)
+        return warped, padded_ratio
 
     def process_frame(
         self,
         frame_path: str,
         aligned_dir: str,
         annotated_dir: Optional[str] = None,
+        crop_specs: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         src = Path(frame_path)
         img_bgr = _imread_unicode(src)
         if img_bgr is None:
             raise ValueError(f"Unable to read frame image: {src}")
 
+        img_h, img_w = img_bgr.shape[:2]
         detections = self._detect(img_bgr)
         faces_result: List[Dict[str, Any]] = []
         annotated_img = img_bgr.copy() if annotated_dir else None
+
+        # Deduplicate requested model crop specs by spec_id
+        unique_specs: Dict[str, Dict[str, Any]] = {}
+        for spec in crop_specs or []:
+            sid = str(spec.get("spec_id", "")).strip()
+            if sid and sid not in unique_specs:
+                unique_specs[sid] = spec
 
         valid_idx = 0
         for box, prob, pts_arr in detections:
             if not _is_valid_face_geometry(box, pts_arr, self.min_face_size):
                 continue
 
-            aligned_face = self._align_face(img_bgr, pts_arr)
+            pose_or_clip_warn = _is_clipped_or_extreme_profile(box, pts_arr, img_w, img_h)
+
+            # 1. Standard canonical aligned face crop (for display & default consumers)
+            aligned_face, disp_padded_ratio = self._warp_with_metrics(
+                img_bgr=img_bgr,
+                box=box,
+                src_landmarks=pts_arr,
+                crop_mode="aligned_square",
+                output_size=self.output_size,
+                margin_scale=self.margin_scale,
+                bbox_margin=1.0,
+                border_mode=self.border_mode,
+            )
 
             face_filename = f"{src.stem}_face_{valid_idx:02d}.png"
             aligned_path = Path(aligned_dir) / face_filename
             _imwrite_unicode(aligned_path, aligned_face)
+
+            # 2. Additional model-native single-pass crops (Option B multi-spec export)
+            model_crops: Dict[str, Dict[str, Any]] = {}
+            for spec_id, spec in unique_specs.items():
+                c_mode = str(spec.get("crop_mode", "aligned_square")).lower()
+                if c_mode == "raw_frame":
+                    model_crops[spec_id] = {
+                        "path": str(src.resolve()),
+                        "output_size": [img_w, img_h],
+                        "crop_mode": "raw_frame",
+                        "border_mode": "none",
+                        "padded_ratio": 0.0,
+                        "unreliable_pose_warning": False,
+                    }
+                    continue
+
+                out_sz = spec.get("output_size", self.output_size)
+                out_tuple = (int(out_sz[0]), int(out_sz[1]))
+                m_scale = float(spec.get("margin_scale", self.margin_scale))
+                b_margin = float(spec.get("bbox_margin", 1.3))
+                b_mode = str(spec.get("border_mode", self.border_mode))
+
+                crop_img, crop_pad_ratio = self._warp_with_metrics(
+                    img_bgr=img_bgr,
+                    box=box,
+                    src_landmarks=pts_arr,
+                    crop_mode=c_mode,
+                    output_size=out_tuple,
+                    margin_scale=m_scale,
+                    bbox_margin=b_margin,
+                    border_mode=b_mode,
+                )
+                spec_path = Path(aligned_dir) / spec_id / face_filename
+                _imwrite_unicode(spec_path, crop_img)
+                model_crops[spec_id] = {
+                    "path": str(spec_path.resolve()),
+                    "output_size": [out_tuple[0], out_tuple[1]],
+                    "crop_mode": c_mode,
+                    "border_mode": b_mode,
+                    "padded_ratio": crop_pad_ratio,
+                    "unreliable_pose_warning": bool(
+                        pose_or_clip_warn or crop_pad_ratio > 0.15
+                    ),
+                }
 
             x1, y1, x2, y2 = [round(float(v), 2) for v in box]
             face_info = {
@@ -216,6 +427,11 @@ class FaceAligner:
                 },
                 "aligned_face_path": str(aligned_path.resolve()),
                 "aligned_size": list(self.output_size),
+                "padded_ratio": disp_padded_ratio,
+                "unreliable_pose_warning": bool(
+                    pose_or_clip_warn or disp_padded_ratio > 0.15
+                ),
+                "model_crops": model_crops,
             }
             faces_result.append(face_info)
 
@@ -245,7 +461,7 @@ class FaceAligner:
 
         return {
             "frame_path": str(src.resolve()),
-            "image_resolution": [int(img_bgr.shape[1]), int(img_bgr.shape[0])],
+            "image_resolution": [int(img_w), int(img_h)],
             "faces_detected": len(faces_result),
             "annotated_frame_path": annotated_path_str,
             "faces": faces_result,

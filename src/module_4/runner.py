@@ -9,13 +9,12 @@ from typing import Any, Dict, List, Optional, Sequence, Type
 import numpy as np
 
 from .base import BaseModule4Detector, compute_suspicion_level, resolve_torch_device
-from .f3net_detector import F3NetDetector
 from .forensic_translator import Module4ForensicTranslator
 
-# Classmates register their detectors ("xception", "sbi", "commfor") here.
-DETECTOR_REGISTRY: Dict[str, Type[BaseModule4Detector]] = {
-    "f3net": F3NetDetector,
-}
+# Active Module 4 detectors.
+# F3NetDetector remains in `src/module_4/f3net_detector.py` (like ELA in Module 3)
+# and is intentionally omitted from the active registry until re-enabled.
+DETECTOR_REGISTRY: Dict[str, Type[BaseModule4Detector]] = {}
 
 
 def register_detector(detector_cls: Type[BaseModule4Detector]) -> None:
@@ -34,10 +33,34 @@ def list_available_detectors() -> List[Dict[str, Any]]:
                 "display_name": inst.display_name,
                 "paradigm": inst.paradigm,
                 "input_size": inst.input_size,
+                "crop_spec": cls.get_crop_spec(),
                 "weights_cached": inst.has_local_weights(),
             }
         )
     return items
+
+
+def get_required_crop_specs(
+    detector_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Collect unique Module 2 CropSpecs required by active Module 4 detectors
+    without instantiating models or downloading weights.
+    """
+    target_ids = (
+        list(detector_ids)
+        if detector_ids is not None
+        else list(DETECTOR_REGISTRY.keys())
+    )
+    unique_specs: Dict[str, Dict[str, Any]] = {}
+    for det_id in target_ids:
+        cls = DETECTOR_REGISTRY.get(det_id)
+        if cls is None:
+            continue
+        spec = cls.get_crop_spec()
+        if spec and spec.get("spec_id") and spec["spec_id"] not in unique_specs:
+            unique_specs[spec["spec_id"]] = spec
+    return list(unique_specs.values())
 
 
 def _get_manifest_dir(m2_manifest: Dict[str, Any]) -> Path:
@@ -59,14 +82,18 @@ def run_module4(
 ) -> Dict[str, Any]:
     """
     Execute Module 4 detectors using Sequential Lazy-Loading:
-      Loads one detector -> evaluates all frames/faces -> saves XAI overlays ->
-      unloads model and frees RAM/VRAM before loading the next detector.
+      Loads one detector -> evaluates pre-cropped inputs from Module 2 ->
+      saves XAI overlays -> unloads model and frees RAM/VRAM before loading the next.
     """
     manifest_dir = _get_manifest_dir(m2_manifest)
     m4_root = manifest_dir / "module4"
     m4_root.mkdir(parents=True, exist_ok=True)
 
-    target_ids = list(detector_ids) if detector_ids is not None else list(DETECTOR_REGISTRY.keys())
+    target_ids = (
+        list(detector_ids)
+        if detector_ids is not None
+        else list(DETECTOR_REGISTRY.keys())
+    )
     resolved_device = str(resolve_torch_device(device))
 
     detector_outputs: Dict[str, Dict[str, Any]] = {}
@@ -98,6 +125,7 @@ def run_module4(
                 "display_name": res["display_name"],
                 "paradigm": res["paradigm"],
                 "input_size": res["input_size"],
+                "crop_spec": cls.get_crop_spec(),
                 "weights_path": res["weights_path"],
                 "device_used": res["device_used"],
                 **res["summary"],
@@ -107,6 +135,15 @@ def run_module4(
             detectors_skipped.append({"detector_id": det_id, "reason": str(exc)})
         finally:
             detector.unload()
+
+    # Build frame_index lookup maps to avoid positional indexing assumptions
+    det_frame_lookup: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for det_id in detectors_executed:
+        by_idx: Dict[int, Dict[str, Any]] = {}
+        for fr in detector_outputs[det_id].get("frames", []) or []:
+            if fr.get("frame_index") is not None:
+                by_idx[int(fr["frame_index"])] = fr
+        det_frame_lookup[det_id] = by_idx
 
     frames_detail_m2 = m2_manifest.get("frames_detail", []) or []
     translator = Module4ForensicTranslator()
@@ -125,7 +162,17 @@ def run_module4(
 
         for det_id in detectors_executed:
             det_res = detector_outputs[det_id]
-            det_frame = det_res["frames"][idx]
+            det_frame = det_frame_lookup[det_id].get(frame_idx)
+            if det_frame is None:
+                det_frame = {
+                    "frame_index": frame_idx,
+                    "frame_path": frame_path,
+                    "evaluated": False,
+                    "fake_probability": None,
+                    "suspicion_level": "low",
+                    "peak_face_id": None,
+                    "faces": [],
+                }
             per_detector_frame[det_id] = det_frame
             per_detector_interp[det_id] = translator.interpret_detector_frame(
                 detector_id=det_id,
@@ -175,6 +222,11 @@ def run_module4(
         max_m4 = 0.0
         topk_m4 = 0.0
 
+    # Video-level aggregation uses mean probability across evaluated frames to avoid
+    # single-frame blur/occlusion outliers triggering false HIGH alerts.
+    is_multi_frame = len(combined_frames) > 1
+    primary_case_score = mean_m4 if is_multi_frame else max_m4
+
     m4_manifest_path = manifest_dir / "module4_manifest.json"
     m4_manifest: Dict[str, Any] = {
         "forensics_metadata": {
@@ -187,6 +239,7 @@ def run_module4(
             "device_target": resolved_device,
             "gradcam_enabled": bool(enable_gradcam),
             "batch_size": int(batch_size),
+            "case_aggregation": "mean" if is_multi_frame else "single_frame",
         },
         "detectors_executed": detectors_executed,
         "detectors_skipped": detectors_skipped,
@@ -197,7 +250,8 @@ def run_module4(
             "mean_module4_score": mean_m4,
             "max_module4_score": max_m4,
             "topk_module4_score": topk_m4,
-            "overall_suspicion": compute_suspicion_level(max_m4),
+            "primary_module4_score": primary_case_score,
+            "overall_suspicion": compute_suspicion_level(primary_case_score),
         },
         "artifacts_directory": {
             "root": str(m4_root.resolve()),

@@ -25,15 +25,17 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 class ModelWeightSpec:
     model_id: str
     filename: str
-    urls: Tuple[str, ...]
+    urls: Tuple[str, ...] = ()
     sha256: Optional[str] = None
     sha256_prefix: Optional[str] = None
+    hf_repo_id: Optional[str] = None
+    hf_allow_patterns: Optional[Tuple[str, ...]] = None
     license_tag: str = "Unknown"
     source_note: str = ""
 
 
-# Registry of Module 4 checkpoints.
-# Classmates can add entries for "xception", "sbi", and "commfor" here.
+# Registry of Module 4 checkpoints (supports single-file .pth URLs and HuggingFace repos).
+# Dormant entries (e.g. "f3net") are kept here for future reactivation.
 MODEL_REGISTRY: Dict[str, ModelWeightSpec] = {
     "f3net": ModelWeightSpec(
         model_id="f3net",
@@ -162,16 +164,89 @@ def _download_file(
     )
 
 
+def _hf_repo_dir(repo_id: str, root: Optional[str] = None) -> Path:
+    cache_root = Path(os.path.expanduser(root) if root is not None else get_cache_dir())
+    safe_name = repo_id.replace("/", "--")
+    return cache_root / "hf" / safe_name
+
+
+def _has_valid_hf_files(repo_dir: Path) -> bool:
+    if not repo_dir.exists() or not repo_dir.is_dir():
+        return False
+    has_config = (repo_dir / "config.json").exists()
+    has_weights = any(
+        p.exists() and p.stat().st_size > 0
+        for p in list(repo_dir.glob("*.safetensors")) + list(repo_dir.glob("*.bin")) + list(repo_dir.glob("*.pth"))
+    )
+    return has_config and has_weights
+
+
+def find_existing_hf_model(
+    repo_id: str, root: Optional[str] = None
+) -> Optional[str]:
+    """Return local cached HuggingFace repo directory if config and weights exist."""
+    safe_name = repo_id.replace("/", "--")
+    candidates = [
+        _hf_repo_dir(repo_id, root=root),
+        _LOCAL_FALLBACK_DIR / "hf" / safe_name,
+    ]
+    for cand in candidates:
+        if _has_valid_hf_files(cand):
+            return str(cand.resolve())
+    return None
+
+
+def ensure_hf_model_dir(
+    repo_id: str,
+    root: Optional[str] = None,
+    auto_download: bool = True,
+    allow_patterns: Optional[Tuple[str, ...]] = None,
+) -> str:
+    """
+    Ensure a HuggingFace model repository snapshot is cached locally under
+    `~/.digital_forensics/models/module_4/hf/<repo>`.
+    """
+    existing = find_existing_hf_model(repo_id, root=root)
+    if existing:
+        return existing
+
+    target_dir = _hf_repo_dir(repo_id, root=root)
+    if not auto_download:
+        raise FileNotFoundError(
+            f"HuggingFace model '{repo_id}' not found at '{target_dir}' and auto_download=False."
+        )
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface-hub is required to download HuggingFace Module 4 models."
+        ) from exc
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(target_dir),
+        allow_patterns=list(allow_patterns) if allow_patterns else None,
+    )
+    if not _has_valid_hf_files(target_dir):
+        raise RuntimeError(
+            f"Downloaded snapshot for '{repo_id}' at '{target_dir}' is missing config or weights."
+        )
+    return str(target_dir.resolve())
+
+
 def find_existing_weights(model_id: str, root: Optional[str] = None) -> Optional[str]:
     """
-    Return the local checkpoint path if already cached (without triggering a download).
-    Checks:
-      1. Cache dir (~/.digital_forensics/models/module_4/<filename> or DIGITAL_FORENSICS_CACHE_DIR)
-      2. Project-local fallback (weights/module_4/<filename>)
+    Return the local checkpoint path (or HF repo folder) if already cached,
+    without triggering a download.
     """
     spec = MODEL_REGISTRY.get(model_id)
     if spec is None:
         raise ValueError(f"Unknown Module 4 model_id: '{model_id}'")
+
+    if spec.hf_repo_id:
+        return find_existing_hf_model(spec.hf_repo_id, root=root)
 
     cache_root = Path(os.path.expanduser(root) if root is not None else get_cache_dir())
     candidates = [
@@ -192,12 +267,20 @@ def ensure_model_weights(
     max_retries: int = 3,
 ) -> str:
     """
-    Ensure weights for `model_id` exist locally and pass SHA-256 verification.
-    Downloads atomically on first use if `auto_download=True`.
+    Ensure weights for `model_id` exist locally and pass verification.
+    Supports both single-file checkpoints and HuggingFace model snapshots.
     """
     spec = MODEL_REGISTRY.get(model_id)
     if spec is None:
         raise ValueError(f"Unknown Module 4 model_id: '{model_id}'")
+
+    if spec.hf_repo_id:
+        return ensure_hf_model_dir(
+            repo_id=spec.hf_repo_id,
+            root=root,
+            auto_download=auto_download,
+            allow_patterns=spec.hf_allow_patterns,
+        )
 
     existing = find_existing_weights(model_id, root=root)
     if existing:

@@ -2,7 +2,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .face_aligner import FaceAligner, _imread_unicode, _is_valid_face_geometry
 from .frame_parser import FrameParser
@@ -53,12 +53,16 @@ def run_module2(
     min_confidence: float = 0.80,
     backend: str = "retinaface",
     burst_length: int = 5,
+    border_mode: str = "replicate",
+    crop_specs: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Pipeline Module 2: Preprocessing & ROI Extraction
     - Extracts evenly spaced non-blank moments (exact requested count when available).
     - Extracts short consecutive frame bursts for video temporal analysis.
-    - Aligns faces on primary moments (256x256) and records lightweight landmarks on burst frames.
+    - Aligns canonical 256x256 display faces plus any model-specific single-pass
+      `crop_specs` directly from raw frames, and records lightweight landmarks
+      on burst frames.
     """
     src = Path(input_path)
     folder_name = case_id or src.stem
@@ -81,7 +85,10 @@ def run_module2(
         backend=backend,
         output_size=output_size,
         min_confidence=min_confidence,
+        border_mode=border_mode,
     )
+
+    normalized_specs = [dict(s) for s in (crop_specs or [])]
 
     frame_reports: List[Dict[str, Any]] = []
     all_aligned_faces: List[str] = []
@@ -98,6 +105,7 @@ def run_module2(
             frame_path=frame_path,
             aligned_dir=str(aligned_dir),
             annotated_dir=str(annotated_dir),
+            crop_specs=normalized_specs,
         )
         report["frame_display_index"] = frame_idx + 1
 
@@ -148,6 +156,8 @@ def run_module2(
             "ai_detector": backend.upper(),
             "confidence_threshold": min_confidence,
             "canonical_resolution": f"{output_size[0]}x{output_size[1]}",
+            "border_mode": border_mode,
+            "model_crop_specs": normalized_specs,
             "sampling_mode": parse_result.get("sampling_mode", "Standard"),
             "target_frames_limit": max_frames,
             "burst_length": parse_result.get("burst_length", 1),
