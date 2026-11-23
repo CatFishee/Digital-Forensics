@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 class Module4ForensicTranslator:
     """
     Plain-English Forensic Translator for Module 4 (Deep Learning & Grad-CAM XAI).
+    Currently tailored for Community Forensics ViT-S/16 (`commfor`).
     """
 
     @staticmethod
@@ -26,16 +27,16 @@ class Module4ForensicTranslator:
     ) -> Dict[str, Any]:
         if not frame_rec.get("evaluated"):
             return {
-                "headline": f"Not Evaluated — No face was detected in this frame for {display_name}.",
+                "headline": f"Not Evaluated — {display_name} had no valid frame input.",
                 "severity": "low",
                 "findings": [
                     {
-                        "title": "No Face Available",
+                        "title": "No Input Available",
                         "severity": "info",
-                        "detail": "Face-based AI detectors require at least one detected face from Module 2.",
+                        "detail": "No valid frame or face region from Module 2 could be evaluated.",
                     }
                 ],
-                "user_guidance": "Inspect a frame where a face is clearly detected.",
+                "user_guidance": "Inspect a valid frame from Module 2.",
             }
 
         score = float(frame_rec.get("fake_probability") or 0.0)
@@ -43,25 +44,133 @@ class Module4ForensicTranslator:
         pct = self._pct(score)
         level = self._friendly_level(sev)
         faces = frame_rec.get("faces", []) or []
-        peak_gid = frame_rec.get("peak_face_id") or "Detected Face"
+        peak_gid = frame_rec.get("peak_face_id") or "Full Frame"
 
         if sev == "high":
             headline = (
-                f"{level} ({pct}) — {display_name} strongly flagged synthetic or manipulated "
+                f"{level} ({pct}) — {display_name} strongly flagged synthetic AI generation "
                 f"patterns on {peak_gid}."
             )
         elif sev == "medium":
             headline = (
-                f"{level} ({pct}) — {display_name} detected moderate manipulation cues on {peak_gid}. "
+                f"{level} ({pct}) — {display_name} detected moderate AI-synthesis cues on {peak_gid}. "
                 "Inspect the Grad-CAM heatmap and cross-check with Module 3."
             )
         else:
             headline = (
-                f"{level} ({pct}) — {display_name} found the face patterns consistent with real media."
+                f"{level} ({pct}) — {display_name} found the frame patterns consistent with real media."
             )
 
         findings: List[Dict[str, str]] = []
 
+        # 1. Lập luận riêng cho Community Forensics ViT-S/16 (commfor)
+        if detector_id == "commfor":
+            if sev in {"high", "medium"}:
+                findings.append(
+                    {
+                        "title": "Full-Frame AI Synthesis Check (Community Forensics ViT-S/16)",
+                        "severity": "alert" if sev == "high" else "warning",
+                        "detail": (
+                            "Evaluates the uncropped whole frame (384x384) to detect generative noise residuals, "
+                            "upsampling fingerprints, and global lighting/texture coherence typical of Diffusion or GAN models."
+                        ),
+                    }
+                )
+            else:
+                findings.append(
+                    {
+                        "title": "Full-Frame AI Synthesis Check (Community Forensics ViT-S/16)",
+                        "severity": "ok",
+                        "detail": (
+                            "Evaluated the uncropped 384x384 frame without finding global Diffusion or GAN "
+                            "synthesis fingerprints across skin, hair, lighting, or background regions."
+                        ),
+                    }
+                )
+
+        # 2. Lập luận về độ tự tin & biên độ logit
+        if faces:
+            peak_face = max(faces, key=lambda x: float(x.get("fake_probability", 0.0)))
+            p_fake = float(peak_face.get("fake_probability", score))
+            p_real = float(peak_face.get("real_probability", 1.0 - p_fake))
+            logits = peak_face.get("logits") or {}
+            fake_logit = logits.get("fake")
+
+            if p_fake >= 0.85:
+                margin_detail = (
+                    f"Model confidence is decisive: P(Fake) = {p_fake * 100:.1f}% vs. P(Real) = {p_real * 100:.1f}%"
+                    + (f" (raw fake logit: {float(fake_logit):+.2f})." if fake_logit is not None else ".")
+                    + " Strong generative indicators outweigh natural camera noise."
+                )
+                margin_sev = "alert"
+            elif p_fake >= 0.65:
+                margin_detail = (
+                    f"Model leans noticeably toward FAKE (P(Fake) = {p_fake * 100:.1f}% vs. P(Real) = {p_real * 100:.1f}%). "
+                    "Verify whether Grad-CAM hotspots match unnatural skin, hair, or background details."
+                )
+                margin_sev = "warning"
+            elif p_fake >= 0.35:
+                margin_detail = (
+                    f"Borderline confidence (P(Fake) = {p_fake * 100:.1f}% vs. P(Real) = {p_real * 100:.1f}%). "
+                    "Heavy social-media compression or low resolution can push scores into this gray zone."
+                )
+                margin_sev = "warning"
+            elif p_fake <= 0.15:
+                margin_detail = (
+                    f"Model confidence is decisively REAL (P(Real) = {p_real * 100:.1f}% vs. P(Fake) = {p_fake * 100:.1f}%)"
+                    + (f" (raw fake logit: {float(fake_logit):+.2f})." if fake_logit is not None else ".")
+                )
+                margin_sev = "ok"
+            else:
+                margin_detail = (
+                    f"Model leans toward REAL (P(Real) = {p_real * 100:.1f}% vs. P(Fake) = {p_fake * 100:.1f}%), "
+                    "with minor low-level anomalies below the manipulation threshold."
+                )
+                margin_sev = "info"
+
+            findings.append(
+                {
+                    "title": "Decision Confidence & Logit Margin",
+                    "severity": margin_sev,
+                    "detail": margin_detail,
+                }
+            )
+
+            # 3. Lập luận từ vùng chú ý không gian Grad-CAM (xai_metrics)
+            xai = peak_face.get("xai_metrics") or {}
+            max_act = float(xai.get("max_activation", 0.0))
+            mean_act = float(xai.get("mean_activation", 0.0))
+            high_area = float(xai.get("high_activation_area_ratio", 0.0))
+
+            if max_act > 0.0:
+                if sev in {"high", "medium"}:
+                    if high_area >= 0.20:
+                        area_note = (
+                            f"Suspect activations span broadly ({high_area * 100:.1f}% of the 384x384 view at >60% intensity, "
+                            f"mean: {mean_act:.2f}, peak: {max_act:.2f}), pointing to pervasive synthetic textures across the scene."
+                        )
+                    else:
+                        area_note = (
+                            f"Grad-CAM pinpointed concentrated high-activation hotspots ({high_area * 100:.1f}% of the view at >60% intensity, "
+                            f"peak: {max_act:.2f}, mean: {mean_act:.2f}). Inspect the warm yellow/red regions (e.g., eyes, hairlines, or textured edges)."
+                        )
+                    xai_sev = "warning"
+                else:
+                    area_note = (
+                        f"Activation remains diffuse relative to the FAKE class "
+                        f"(mean: {mean_act:.2f}, >60% area: {high_area * 100:.1f}%), consistent with natural pixel structure."
+                    )
+                    xai_sev = "ok"
+
+                findings.append(
+                    {
+                        "title": "Grad-CAM Spatial Attention Evidence",
+                        "severity": xai_sev,
+                        "detail": area_note,
+                    }
+                )
+
+        # 4. Cảnh báo cắt viền / góc nghiêng (nếu có)
         unreliable_faces = [
             f.get("global_face_id", "Face")
             for f in faces
@@ -73,9 +182,8 @@ class Module4ForensicTranslator:
                     "title": "Edge-Clipped or Extreme Angle Face",
                     "severity": "warning",
                     "detail": (
-                        f"Face crop(s) for {', '.join(unreliable_faces)} were partially outside the frame "
-                        "or at an extreme side profile. Raise the Confidence Threshold or inspect the crop "
-                        "image closely, as heavy edge padding or extreme angles reduce reliability."
+                        f"Input crop(s) for {', '.join(unreliable_faces)} were partially outside the frame "
+                        "or at an extreme angle, which can reduce reliability."
                     ),
                 }
             )
@@ -87,34 +195,16 @@ class Module4ForensicTranslator:
             ]
             findings.append(
                 {
-                    "title": "Per-Face AI Scores",
+                    "title": "Per-Region AI Scores",
                     "severity": "info",
                     "detail": ", ".join(parts),
                 }
             )
 
-        if detector_id == "f3net" and faces:
-            peak_face = max(faces, key=lambda x: float(x["fake_probability"]))
-            bands = peak_face.get("fad_band_energy", {}) or {}
-            high_b = float(bands.get("high_band_share", 0.0))
-            mid_b = float(bands.get("mid_band_share", 0.0))
-            low_b = float(bands.get("low_band_share", 0.0))
-            findings.append(
-                {
-                    "title": "DCT Frequency-Band Energy Share (FAD)",
-                    "severity": "info",
-                    "detail": (
-                        f"Low-freq: {low_b * 100:.1f}%, Mid-freq: {mid_b * 100:.1f}%, "
-                        f"High-freq: {high_b * 100:.1f}%. F3Net inspects all bands simultaneously "
-                        "to catch frequency traces missed in RGB pixels."
-                    ),
-                }
-            )
-
         guidance = (
-            "How to read the Grad-CAM image: Warm yellow/red zones show which facial regions "
-            "(eyes, mouth, nose, or jawline) pushed the AI model most strongly toward predicting FAKE. "
-            "Compare these hotspots with Module 3's Face Border and Pixel Grain heatmaps."
+            "How to read Community Forensics Grad-CAM: Warm yellow/red zones across the 384x384 full frame "
+            "highlight where global AI synthesis traces (skin smoothness, hair edges, or background artifacts) "
+            "pushed the model toward FAKE. Compare these hotspots with Module 3's Pixel Grain and 2D-FFT results."
         )
 
         return {
@@ -129,6 +219,7 @@ class Module4ForensicTranslator:
         detectors_active = m4_manifest.get("detectors_executed", []) or []
         detectors_skipped = m4_manifest.get("detectors_skipped", []) or []
         frames = m4_manifest.get("frames_detail", []) or []
+        det_summaries = m4_manifest.get("detector_summaries", {}) or {}
 
         if not detectors_active:
             if detectors_skipped:
@@ -171,17 +262,17 @@ class Module4ForensicTranslator:
 
         if overall_sev == "high":
             headline = (
-                f"{level} ({primary_pct}) — Deep learning analysis detected strong AI manipulation "
+                f"{level} ({primary_pct}) — Deep learning analysis detected strong AI-generated "
                 "indicators in this media."
             )
         elif overall_sev == "medium":
             headline = (
-                f"{level} ({primary_pct}) — Deep learning models flagged moderate suspicion. "
+                f"{level} ({primary_pct}) — Deep learning analysis flagged moderate suspicion. "
                 "Review the Grad-CAM overlays and Module 3 signal clues together."
             )
         else:
             headline = (
-                f"{level} ({primary_pct}) — Active deep learning detector(s) scored this media as likely real."
+                f"{level} ({primary_pct}) — Active deep learning detector scored this media as likely real."
             )
 
         findings: List[Dict[str, str]] = []
@@ -192,8 +283,22 @@ class Module4ForensicTranslator:
                     "title": "Frame Coverage",
                     "severity": "info",
                     "detail": (
-                        f"Evaluated {len(eval_frames)}/{len(frames)} frames with faces "
+                        f"Evaluated {len(eval_frames)}/{len(frames)} frames "
                         f"(video average: {self._pct(mean_score)}, highest single frame: {peak_pct})."
+                    ),
+                }
+            )
+
+        if len(detectors_active) == 1:
+            only_id = detectors_active[0]
+            ds = det_summaries.get(only_id, {})
+            findings.append(
+                {
+                    "title": "Active Forensic Model",
+                    "severity": "info",
+                    "detail": (
+                        f"Evaluated using {ds.get('display_name', only_id.upper())} "
+                        f"({ds.get('paradigm', 'Deep Learning Forensics')})."
                     ),
                 }
             )
@@ -211,7 +316,6 @@ class Module4ForensicTranslator:
             )
 
         peak_frames: List[Dict[str, Any]] = []
-        det_summaries = m4_manifest.get("detector_summaries", {}) or {}
         for det_id in detectors_active:
             ds = det_summaries.get(det_id, {})
             det_frames = [
