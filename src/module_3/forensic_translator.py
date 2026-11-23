@@ -5,10 +5,10 @@ from typing import Any, Dict, List
 class Module3ForensicTranslator:
     """
     Deterministic Rule-Based Forensic Translator for Module 3:
-      - Noise Residual Consistency (SRM)
-      - Face-Boundary Blending & Chrominance Mismatch
+      - Noise Residual & Intra-Face Patch Consistency (SRM)
+      - Face-Boundary Blending & Internal Splice Seam Analysis
       - Temporal Face Flicker & Inter-Frame Consistency (Video Bursts)
-      - 2D-FFT Spectral & 1/f Decay Analysis
+      - 2D-FFT Spectral, Quadrant Discrepancy & 1/f Decay Analysis
     All metric keys match the analyzers 1:1 and use simple plain-English phrasing.
     """
 
@@ -50,18 +50,22 @@ class Module3ForensicTranslator:
         face_smoother = metrics.get("face_smoother_than_bg")
         chroma_contrast = metrics.get("face_bg_chroma_contrast")
 
+        intra_cv = metrics.get("intra_face_noise_cv")
+        intra_p90_p10 = metrics.get("intra_face_p90_p10_ratio")
+        intra_outliers = metrics.get("intra_face_outlier_ratio")
+
         findings: List[Dict[str, str]] = []
 
         if suspicion == "high":
             headline = (
                 f"{level_label} ({pct}) — Strong pixel-grain mismatches were found. "
-                "The skin texture inside the face differs sharply from the surrounding scene, "
-                "which can happen when a face is swapped or edited."
+                "Grain levels vary unnaturally across the face or differ sharply from the surrounding scene, "
+                "which commonly occurs with face-swaps, inpainting, or localized retouching."
             )
         elif suspicion == "medium":
             headline = (
                 f"{level_label} ({pct}) — Moderate pixel-grain differences appear in this frame. "
-                "The face skin texture behaves somewhat differently from the background."
+                "Different parts of the face show conflicting grain intensity."
             )
         else:
             headline = (
@@ -69,17 +73,66 @@ class Module3ForensicTranslator:
                 "No strong noise-floor mismatches stood out."
             )
 
+        # 1. Intra-face patch noise dispersion (catches localized component splices / inpainting)
+        if intra_cv is not None and intra_p90_p10 is not None:
+            c_val = float(intra_cv)
+            p_val = float(intra_p90_p10)
+            if c_val >= 1.20 or p_val >= 4.20:
+                findings.append(
+                    {
+                        "title": "Severe Grain Discrepancy Across Face Patches",
+                        "severity": "alert",
+                        "detail": (
+                            "Different regions of the same face exhibit sharply conflicting camera grain. "
+                            "One facial patch is significantly smoother or grainier than adjacent skin, "
+                            "a signature of localized component splicing or inpainting."
+                        ),
+                    }
+                )
+            elif c_val >= 0.85 or p_val >= 2.80:
+                findings.append(
+                    {
+                        "title": "Uneven Grain Variation Across Face Skin",
+                        "severity": "warning",
+                        "detail": (
+                            "Skin texture grain varies noticeably between different areas of the face, "
+                            "which can indicate localized retouching or partial face edits."
+                        ),
+                    }
+                )
+            else:
+                findings.append(
+                    {
+                        "title": "Uniform Facial Skin Grain",
+                        "severity": "ok",
+                        "detail": "Pixel grain distribution remains consistent across all regions of the face.",
+                    }
+                )
+
+        if intra_outliers is not None and float(intra_outliers) >= 0.18:
+            findings.append(
+                {
+                    "title": "Localized Noise Outlier Cluster",
+                    "severity": "warning",
+                    "detail": (
+                        "A distinct cluster of blocks inside the face deviates sharply from the dominant "
+                        "facial noise floor, pointing to a localized pasted region."
+                    ),
+                }
+            )
+
+        # 2. Global Face vs Background noise contrast
         if face_contrast is not None and face_noise is not None and bg_noise is not None:
-            c_val = float(face_contrast)
+            fc_val = float(face_contrast)
             direction_text = (
                 "smoother (less natural grain) than the background"
                 if face_smoother
                 else "noisier or sharper than the background"
             )
-            if c_val >= 0.90:
+            if fc_val >= 0.90:
                 findings.append(
                     {
-                        "title": "Strong Grain Mismatch Between Face Skin and Scene",
+                        "title": "Strong Grain Mismatch Between Face and Scene",
                         "severity": "alert",
                         "detail": (
                             f"The face skin looks noticeably {direction_text}. "
@@ -87,10 +140,10 @@ class Module3ForensicTranslator:
                         ),
                     }
                 )
-            elif c_val >= 0.45:
+            elif fc_val >= 0.45:
                 findings.append(
                     {
-                        "title": "Moderate Grain Difference Between Face Skin and Scene",
+                        "title": "Moderate Grain Difference Between Face and Scene",
                         "severity": "warning",
                         "detail": (
                             f"The face skin appears somewhat {direction_text}. "
@@ -98,22 +151,6 @@ class Module3ForensicTranslator:
                         ),
                     }
                 )
-            else:
-                findings.append(
-                    {
-                        "title": "Consistent Face and Background Grain",
-                        "severity": "ok",
-                        "detail": "The fine pixel grain on the face skin matches the surrounding scene well.",
-                    }
-                )
-        else:
-            findings.append(
-                {
-                    "title": "No Face Detected for Grain Comparison",
-                    "severity": "info",
-                    "detail": "No valid face box was available, so only overall frame grain uniformity was checked.",
-                }
-            )
 
         if chroma_contrast is not None and float(chroma_contrast) >= 0.60:
             findings.append(
@@ -130,7 +167,7 @@ class Module3ForensicTranslator:
         if p95_p50 >= 6.0 or block_cv >= 1.35:
             findings.append(
                 {
-                    "title": "Uneven Grain Patches Across Frame",
+                    "title": "Uneven Grain Patches Across Background",
                     "severity": "warning",
                     "detail": (
                         "Some regions of the frame have noticeably heavier or smoother grain than others, "
@@ -138,18 +175,10 @@ class Module3ForensicTranslator:
                     ),
                 }
             )
-        else:
-            findings.append(
-                {
-                    "title": "Steady Background Grain",
-                    "severity": "ok",
-                    "detail": "Grain levels across regions stay within a normal natural range.",
-                }
-            )
 
         user_guidance = (
-            "How to read the images above: The left image hides colors and lighting to show only tiny pixel grain; "
-            "the heatmap on the right shows smooth/low-grain areas in dark blue and high-grain areas in yellow-red."
+            "How to read the images above: The left image isolates fine pixel grain (SRM residual); "
+            "the heatmap on the right displays smooth/low-grain areas in dark blue/purple and high-grain areas in bright yellow-red."
         )
 
         return {
@@ -173,7 +202,11 @@ class Module3ForensicTranslator:
         chroma_diff = metrics.get("skin_context_chroma_diff")
         chroma_bleed = metrics.get("seam_chroma_bleed")
         sharp_ratio = metrics.get("inner_outer_sharpness_ratio")
+        internal_seam = metrics.get("internal_seam_ratio")
+        bilateral_chroma = metrics.get("bilateral_chroma_diff")
+        bilateral_grad = metrics.get("bilateral_gradient_ratio")
         unreliable = bool(metrics.get("unreliable_face_warning", False))
+        asym_detected = bool(metrics.get("anatomical_asymmetry_detected", False))
 
         findings: List[Dict[str, str]] = []
 
@@ -193,37 +226,94 @@ class Module3ForensicTranslator:
 
         if suspicion == "high":
             headline = (
-                f"{level_label} ({pct}) — Clear blending or color mismatches appear around the edge of the face. "
-                "The cheeks/jawline border or skin color tone does not transition naturally into the neck and surroundings."
+                f"{level_label} ({pct}) — Clear blending seams, internal inpainting edges, or skin-tone mismatches "
+                "were detected. The cheeks/jawline or internal facial features do not blend naturally."
             )
         elif suspicion == "medium":
             headline = (
-                f"{level_label} ({pct}) — Mild blending or color differences appear near the face border. "
-                "Inspect the face outline in the heatmap for faint seams or tone shifts."
+                f"{level_label} ({pct}) — Moderate blending or color differences appear along the face border or midface. "
+                "Inspect the heatmap for unnatural seams or bilateral tone shifts."
             )
         else:
             headline = (
-                f"{level_label} ({pct}) — The face edge and skin tone blend naturally into the neck and surroundings."
+                f"{level_label} ({pct}) — The face edge, internal features, and skin tone blend naturally."
+            )
+
+        if asym_detected:
+            findings.append(
+                {
+                    "title": "Severe Bilateral Facial Asymmetry Detected",
+                    "severity": "alert",
+                    "detail": (
+                        "The relative alignment of the eyes and nose deviates sharply from natural bilateral symmetry "
+                        "on this frontal face, characteristic of spliced facial components (e.g. mismatched eye/nose sources)."
+                    ),
+                }
             )
 
         if unreliable:
             findings.append(
                 {
-                    "title": "Extreme Angle or Covered Face",
+                    "title": "Edge-Clipped Face Warning",
                     "severity": "warning",
                     "detail": (
-                        "Extreme side profiles and partially covered or cut-off faces make border and color results unreliable. "
-                        "Raise the Confidence Threshold in the sidebar if partially hidden faces are affecting the score."
+                        "The face is partially cut off at the image boundary. Outer perimeter border metrics "
+                        "may be influenced by frame borders."
                     ),
                 }
             )
 
+        # Internal splice seam findings (bridges the visual heatmap to the verbal verdict)
+        if internal_seam is not None:
+            is_val = float(internal_seam)
+            if is_val >= 3.20:
+                findings.append(
+                    {
+                        "title": "Strong Internal Splice or Inpainting Seam",
+                        "severity": "alert",
+                        "detail": (
+                            "A sharp, unnatural gradient boundary cuts across smooth facial skin "
+                            "(e.g. across the nose or cheek), matching the bright seam visible on the heatmap."
+                        ),
+                    }
+                )
+            elif is_val >= 2.40:
+                findings.append(
+                    {
+                        "title": "Mild Internal Feature Seam",
+                        "severity": "warning",
+                        "detail": "A faint gradient step-edge is present across the internal face canvas.",
+                    }
+                )
+
+        # Bilateral chrominance / lighting symmetry
+        if bilateral_chroma is not None and float(bilateral_chroma) >= 12.0:
+            findings.append(
+                {
+                    "title": "Bilateral Skin-Tone Split",
+                    "severity": "alert",
+                    "detail": (
+                        f"The left and right sides of the face exhibit a substantial color tone discrepancy "
+                        f"(Lab ΔE: {float(bilateral_chroma):.1f}), indicating composite lighting or mismatched sources."
+                    ),
+                }
+            )
+        elif bilateral_chroma is not None and float(bilateral_chroma) >= 8.0:
+            findings.append(
+                {
+                    "title": "Mild Bilateral Color Asymmetry",
+                    "severity": "warning",
+                    "detail": "Slight color tint discrepancy between the left and right facial halves.",
+                }
+            )
+
+        # Perimeter jawline/neck checks
         if seam_halo is not None:
             sh_val = float(seam_halo)
             if sh_val >= 2.6:
                 findings.append(
                     {
-                        "title": "Strong Blending Halo Along Face Edge",
+                        "title": "Strong Blending Halo Along Jawline",
                         "severity": "alert",
                         "detail": "An unusually sharp or double-edged transition appears along the lower face outline.",
                     }
@@ -231,49 +321,20 @@ class Module3ForensicTranslator:
             elif sh_val >= 1.95:
                 findings.append(
                     {
-                        "title": "Mild Edge Transition Along Face Outline",
+                        "title": "Mild Edge Transition Along Jawline",
                         "severity": "warning",
                         "detail": "A slight sharpness change appears around the cheeks or jawline border.",
                     }
                 )
-            else:
-                findings.append(
-                    {
-                        "title": "Clean Face-to-Neck Edge",
-                        "severity": "ok",
-                        "detail": "No artificial blending halo was detected along the jawline and cheeks.",
-                    }
-                )
 
-        if chroma_diff is not None:
-            cd_val = float(chroma_diff)
-            if cd_val >= 18.0:
-                findings.append(
-                    {
-                        "title": "Strong Skin-Color Mismatch",
-                        "severity": "alert",
-                        "detail": (
-                            "The color tone inside the face differs noticeably from the immediate neck or outer jaw area, "
-                            "which is common when a swapped face is imperfectly color-matched."
-                        ),
-                    }
-                )
-            elif cd_val >= 11.5:
-                findings.append(
-                    {
-                        "title": "Slight Skin-Tone Shift",
-                        "severity": "warning",
-                        "detail": "The face tint shifts slightly compared to the outer neck/jaw area.",
-                    }
-                )
-            else:
-                findings.append(
-                    {
-                        "title": "Consistent Skin Color Tone",
-                        "severity": "ok",
-                        "detail": "Face skin color matches the immediate neck and surroundings naturally.",
-                    }
-                )
+        if chroma_diff is not None and float(chroma_diff) >= 18.0:
+            findings.append(
+                {
+                    "title": "Strong Face-vs-Neck Color Mismatch",
+                    "severity": "alert",
+                    "detail": "Skin color inside the face differs noticeably from the outer neck and surroundings.",
+                }
+            )
 
         if chroma_bleed is not None and float(chroma_bleed) >= 2.0:
             findings.append(
@@ -289,16 +350,13 @@ class Module3ForensicTranslator:
                 {
                     "title": "Sharpness Mismatch (Inner Face vs. Outer Scene)",
                     "severity": "warning",
-                    "detail": (
-                        "The inside of the face is noticeably softer or sharper than the immediate surroundings, "
-                        "which can happen when a lower-resolution swapped face is pasted onto a sharper scene."
-                    ),
+                    "detail": "The inside of the face is noticeably softer or sharper than the immediate surroundings.",
                 }
             )
 
         user_guidance = (
-            "How to read the images above: The left image shows the exact jawline/cheek border zone being checked; "
-            "the heatmap on the right glows bright orange/yellow if there are color fringes or unnatural seams along that border."
+            "How to read the images above: The left image shows the inspected boundary zones (ellipses outline the jawline); "
+            "the heatmap on the right glows bright orange/yellow wherever abrupt gradient cuts, color fringes, or inpainting seams occur."
         )
 
         return {
@@ -341,10 +399,7 @@ class Module3ForensicTranslator:
         lum_flicker = metrics.get("brightness_flicker")
         unreliable = bool(metrics.get("unreliable_face_warning", False))
         faces_tracked = int(metrics.get("faces_tracked_count", 0) or 0)
-        peak_face_id = metrics.get("peak_face_id")
-        if not peak_face_id:
-            p_idx = metrics.get("peak_face_index")
-            peak_face_id = f"Face #{p_idx}" if p_idx is not None else "Face"
+        peak_face_id = metrics.get("peak_face_id") or "Face"
 
         per_face_scores = temporal_res.get("faces", []) or []
 
@@ -381,22 +436,17 @@ class Module3ForensicTranslator:
         if unreliable:
             findings.append(
                 {
-                    "title": "Extreme Angle or Covered Face",
+                    "title": "Edge-Clipped Face Notice",
                     "severity": "warning",
-                    "detail": (
-                        "Extreme side profiles and partially covered or cut-off faces make frame-to-frame tracking unreliable. "
-                        "Raise the Confidence Threshold in the sidebar if edge faces are affecting the score."
-                    ),
+                    "detail": "Face is close to the frame boundary during burst tracking.",
                 }
             )
 
         if faces_tracked >= 2 and per_face_scores:
-            parts = []
-            for pf in per_face_scores:
-                gid = pf.get("global_face_id") or f"Face #{pf.get('face_index', 0)}"
-                sc_str = self._pct(pf.get("temporal_score", 0.0))
-                parts.append(f"{gid}: {sc_str}")
-
+            parts = [
+                f"{pf.get('global_face_id', 'Face')}: {self._pct(pf.get('temporal_score', 0.0))}"
+                for pf in per_face_scores
+            ]
             findings.append(
                 {
                     "title": "All Tracked Faces in This Burst",
@@ -408,42 +458,21 @@ class Module3ForensicTranslator:
                 }
             )
 
-        if lm_jitter is not None:
-            lj = float(lm_jitter)
-            if lj >= 0.025:
-                findings.append(
-                    {
-                        "title": "Facial Feature Jitter Detected",
-                        "severity": "alert",
-                        "detail": "Eyes, nose, or mouth positions wobble noticeably from one frame to the next.",
-                    }
-                )
-            elif lj >= 0.015:
-                findings.append(
-                    {
-                        "title": "Slight Feature Wobble",
-                        "severity": "warning",
-                        "detail": "Minor frame-to-frame wobble appears in facial landmark alignment.",
-                    }
-                )
-            else:
-                findings.append(
-                    {
-                        "title": "Steady Facial Alignment",
-                        "severity": "ok",
-                        "detail": "Eyes, nose, and mouth move smoothly from frame to frame without artificial jitter.",
-                    }
-                )
+        if lm_jitter is not None and float(lm_jitter) >= 0.025:
+            findings.append(
+                {
+                    "title": "Facial Feature Jitter Detected",
+                    "severity": "alert",
+                    "detail": "Eyes, nose, or mouth positions wobble noticeably from one frame to the next.",
+                }
+            )
 
         if tex_flicker is not None and float(tex_flicker) >= 0.90:
             findings.append(
                 {
                     "title": "Skin Texture Flickering",
                     "severity": "warning",
-                    "detail": (
-                        "Fine skin details change rapidly between adjacent frames even after aligning the face, "
-                        "which can happen when a deepfake generates each frame independently."
-                    ),
+                    "detail": "Fine skin details change rapidly between adjacent frames, typical of per-frame generation.",
                 }
             )
 
@@ -457,18 +486,10 @@ class Module3ForensicTranslator:
                     "detail": "Skin brightness or color tint fluctuates suddenly across consecutive frames.",
                 }
             )
-        else:
-            findings.append(
-                {
-                    "title": "Consistent Skin Color & Lighting",
-                    "severity": "ok",
-                    "detail": "Face brightness and color tone remain smooth across the burst.",
-                }
-            )
 
         user_guidance = (
             "How to read the visuals above: The heatmap glows bright where skin texture flickers between consecutive frames; "
-            "the charts on the right should stay flat and below the dashed grey line in a normal real video."
+            "the stability plots on the right should remain steady in a normal real video."
         )
 
         return {
@@ -497,18 +518,18 @@ class Module3ForensicTranslator:
         if suspicion == "high":
             headline = (
                 f"{level_label} ({pct}) — Strong frequency anomalies were detected. "
-                "Unusual repeating grid dots or abnormal detail roll-off appear, "
-                "which commonly come from AI generation, upscaling, or face-swapping."
+                "Repeating grid dots, sub-region spectral divergence, or abnormal detail roll-off appear, "
+                "characteristic of synthetic generation or face inpainting."
             )
         elif suspicion == "medium":
             headline = (
                 f"{level_label} ({pct}) — Moderate frequency irregularities were found. "
-                "Some fine-detail patterns deviate from a typical natural camera curve."
+                "Some sub-region fine-detail patterns deviate from a typical natural camera curve."
             )
         else:
             headline = (
                 f"{level_label} ({pct}) — Frequency patterns look natural. "
-                "No strong repeating AI grid traces or abnormal spectral deviations were found."
+                "No strong repeating grid traces or sub-region spectral mismatches were found."
             )
 
         primary_label = "Full Frame"
@@ -528,6 +549,30 @@ class Module3ForensicTranslator:
         roughness = float(pm.get("radial_roughness", 0.0))
         fit_rmse = float(pm.get("radial_fit_rmse", 0.0))
         slope = float(pm.get("spectral_slope", 1.2))
+        quad_slope = pm.get("quadrant_slope_discrepancy")
+        quad_hf = pm.get("quadrant_hf_discrepancy")
+
+        # Sub-region / quadrant spectral divergence
+        if quad_slope is not None and float(quad_slope) >= 0.95:
+            findings.append(
+                {
+                    "title": f"Sub-Region Frequency Discrepancy ({primary_label})",
+                    "severity": "alert",
+                    "detail": (
+                        "Different quadrants of the face exhibit sharply conflicting frequency decay slopes. "
+                        "One facial quadrant possesses unnatural smoothness or synthetic high frequencies "
+                        "compared to adjacent quadrants."
+                    ),
+                }
+            )
+        elif quad_slope is not None and float(quad_slope) >= 0.65:
+            findings.append(
+                {
+                    "title": f"Mild Quadrant Frequency Divergence ({primary_label})",
+                    "severity": "warning",
+                    "detail": "Minor discrepancy in frequency decay between different quadrants of the face crop.",
+                }
+            )
 
         if top20_z >= 5.2 or max_z >= 7.0:
             findings.append(
@@ -535,8 +580,8 @@ class Module3ForensicTranslator:
                     "title": f"Repeating Grid Pattern Found ({primary_label})",
                     "severity": "alert",
                     "detail": (
-                        "Unusual repeating bright dots appear in the frequency scan. "
-                        "AI generators and face-swap tools often leave faint grid patterns like these."
+                        "Unusual repeating bright spikes appear in the frequency scan, "
+                        "a hallmark of GAN/diffusion convolutional upsampling."
                     ),
                 }
             )
@@ -545,18 +590,15 @@ class Module3ForensicTranslator:
                 {
                     "title": f"Mild Repeating Patterns ({primary_label})",
                     "severity": "warning",
-                    "detail": "A few small repeating spots appear in the frequency scan.",
+                    "detail": "A few repeating frequency spikes appear outside the normal camera range.",
                 }
             )
         else:
             findings.append(
                 {
-                    "title": "No Repeating AI Grid Dots Found",
+                    "title": "No Repeating AI Grid Spikes",
                     "severity": "ok",
-                    "detail": (
-                        "No sharp repeating grid dots stood out. Note that resizing or compression "
-                        "can smooth out faint grid dots."
-                    ),
+                    "detail": "No sharp repeating checkerboard spikes were detected.",
                 }
             )
 
@@ -572,10 +614,7 @@ class Module3ForensicTranslator:
                 {
                     "title": f"Abnormal Fine-Detail Curve ({primary_label})",
                     "severity": "warning",
-                    "detail": (
-                        "The orange spectrum curve bends away from a normal natural camera slope, "
-                        "which can point to synthetic textures, upscaling, or over-smoothing."
-                    ),
+                    "detail": "The radial spectrum curve bends away from a natural camera 1/f decay slope.",
                 }
             )
         else:
@@ -583,37 +622,14 @@ class Module3ForensicTranslator:
                 {
                     "title": "Natural Detail Roll-Off",
                     "severity": "ok",
-                    "detail": "The frequency curve follows a smooth, natural camera decay from left to right.",
+                    "detail": "The frequency curve follows a smooth, natural camera decay from low to high frequency.",
                 }
             )
 
-        if max_face_score is not None:
-            face_val = float(max_face_score)
-            if face_val >= frame_score + 0.15:
-                findings.append(
-                    {
-                        "title": "Anomaly Concentrated Inside Face",
-                        "severity": "warning",
-                        "detail": (
-                            f"The zoomed-in face scan ({self._pct(face_val)}) scores higher than the full frame ({self._pct(frame_score)})."
-                        ),
-                    }
-                )
-            elif frame_score >= face_val + 0.15:
-                findings.append(
-                    {
-                        "title": "Full Frame Higher Than Face",
-                        "severity": "info",
-                        "detail": (
-                            f"The full frame ({self._pct(frame_score)}) scores higher than the isolated face ({self._pct(face_val)})."
-                        ),
-                    }
-                )
-
         user_guidance = (
-            "How to read the frequency images: Bright straight lines crossing the center come from normal edges "
-            "like borders or text boxes. Suspicious AI traces look like matching pairs of bright dots away from the center lines, "
-            "or the orange curve bending sharply away from the dotted blue camera trend line."
+            "How to read the frequency images: Straight cross lines through the center reflect natural image borders; "
+            "suspicious synthetic traces appear as symmetrical bright dot pairs off-axis, or as sharp deviations "
+            "between the observed orange curve and the blue 1/f camera trend line."
         )
 
         return {
@@ -645,18 +661,17 @@ class Module3ForensicTranslator:
         elif comb_sev == "medium":
             headline = (
                 f"{level_label} ({pct}) — Moderate signal irregularities were found in this frame. "
-                "Inspect the Face Border, Flicker, Grain, and 2D-FFT tabs for visual clues."
+                "Inspect the Face Border & Seams, Grain, and Frequency tabs for visual confirmation."
             )
         else:
             headline = (
-                f"{level_label} ({pct}) — Physical signal checks look mostly normal in this frame "
-                "(note: modern AI fakes can still require Module 4 Deep Learning to detect)."
+                f"{level_label} ({pct}) — Physical signal checks look mostly normal in this frame."
             )
 
         key_takeaways = [
-            f"Face Border & Color Match: {boundary_interp['headline']}",
-            f"Pixel Grain (Noise): {noise_interp['headline']}",
-            f"Frequency Check (2D-FFT): {fft_interp['headline']}",
+            f"Face Border & Internal Seams: {boundary_interp['headline']}",
+            f"Pixel Grain (Noise Consistency): {noise_interp['headline']}",
+            f"Frequency Check (2D-FFT & Quadrants): {fft_interp['headline']}",
         ]
         if temporal_used:
             key_takeaways.insert(
@@ -698,10 +713,6 @@ class Module3ForensicTranslator:
             frames, key=lambda f: float(f["summary"]["effective_fft_score"])
         )
 
-        high_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "high")
-        med_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "medium")
-        low_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "low")
-
         overall_sev = str(m3_sum.get("overall_suspicion", "low")).lower()
         max_comb = float(m3_sum.get("max_module3_score", 0.0))
         mean_comb = float(m3_sum.get("mean_module3_score", 0.0))
@@ -710,21 +721,23 @@ class Module3ForensicTranslator:
 
         if overall_sev == "high":
             headline = (
-                f"{level_label} ({peak_pct}) — Signal forensics flagged strong blending, flicker, grain, or frequency anomalies."
+                f"{level_label} ({peak_pct}) — Signal forensics flagged strong blending seams, "
+                "patch grain inconsistency, or frequency anomalies."
             )
         elif overall_sev == "medium":
             headline = (
-                f"{level_label} ({peak_pct}) — Moderate signal irregularities were detected. "
-                "Combine this evidence with AI deepfake detection (Module 4)."
+                f"{level_label} ({peak_pct}) — Moderate signal irregularities were detected across frames."
             )
         else:
             headline = (
-                f"{level_label} ({peak_pct}) — No strong physical signal anomalies stood out, though modern AI-generated "
-                "media often requires Module 4 (Deep Learning) to detect."
+                f"{level_label} ({peak_pct}) — Physical signal checks found no strong anomalies across frames."
             )
 
         findings: List[Dict[str, str]] = []
         if len(frames) > 1:
+            high_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "high")
+            med_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "medium")
+            low_cnt = sum(1 for f in frames if f["summary"]["combined_suspicion"] == "low")
             findings.append(
                 {
                     "title": "Frame-by-Frame Breakdown",
@@ -738,7 +751,7 @@ class Module3ForensicTranslator:
 
         peak_frames: List[Dict[str, Any]] = [
             {
-                "label": "Peak Border & Color" if len(frames) > 1 else "Border & Color",
+                "label": "Peak Border & Seams" if len(frames) > 1 else "Border & Seams",
                 "frame_index": max_bound_frame["frame_index"],
                 "score": float(max_bound_frame["summary"]["boundary_score"]),
                 "severity": str(max_bound_frame["summary"]["boundary_suspicion"]).lower(),

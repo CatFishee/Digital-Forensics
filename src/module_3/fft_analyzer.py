@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import matplotlib
@@ -70,8 +70,9 @@ class FFTAnalyzer:
     Module 3.2: Calibrated 2D Fast Fourier Transform & 1/f Spectral Decay Analysis.
     Detects:
       1. Periodic checkerboard spikes from GAN/Deepfake upsampling.
-      2. Abnormal 1/f^alpha spectral decay (extreme slope or curve bumps).
+      2. Abnormal 1/f^alpha spectral decay (slope or curve bumps).
       3. Extreme high-frequency luminance/chrominance aliasing.
+      4. Sub-region / quadrant spectral discrepancy across face crops.
     """
 
     def __init__(self, inner_cutoff: float = 0.12, mid_cutoff: float = 0.50):
@@ -100,6 +101,65 @@ class FFTAnalyzer:
         )
         high_e = float(np.mean(log_spec[high_mask])) if np.any(high_mask) else 0.0
         return float(high_e / max(low_mid_e, 1e-6))
+
+    def _analyze_quadrant_discrepancy(self, y_chan: np.ndarray) -> Tuple[float, float]:
+        """
+        Divide face crop into 4 quadrants (top-left, top-right, bottom-left, bottom-right)
+        to spot localized frequency discrepancies from patched/inpainted regions.
+        """
+        h, w = y_chan.shape
+        if h < 64 or w < 64:
+            return 0.0, 1.0
+
+        mid_y, mid_x = h // 2, w // 2
+        quadrants = [
+            y_chan[:mid_y, :mid_x],
+            y_chan[:mid_y, mid_x:],
+            y_chan[mid_y:, :mid_x],
+            y_chan[mid_y:, mid_x:],
+        ]
+
+        slopes: list[float] = []
+        hf_ratios: list[float] = []
+
+        for q in quadrants:
+            qh, qw = q.shape
+            q_cent = q - float(np.mean(q))
+            hann_2d = np.outer(np.hanning(qh), np.hanning(qw)).astype(np.float32)
+            f_shift = np.fft.fftshift(np.fft.fft2(q_cent * hann_2d))
+            log_spec = np.log1p(np.abs(f_shift).astype(np.float32))
+
+            cy, cx = qh // 2, qw // 2
+            y_i, x_i = np.indices((qh, qw))
+            r_px = np.sqrt((x_i - cx) ** 2 + (y_i - cy) ** 2)
+            r_max = max(float(min(cy, cx)), 1.0)
+            r_norm = r_px / r_max
+
+            low_mid = (r_norm >= 0.05) & (r_norm < self.mid_cutoff)
+            high = (r_norm >= self.mid_cutoff) & (r_norm <= 0.95)
+            e_low = float(np.mean(log_spec[low_mid])) if np.any(low_mid) else 1e-6
+            e_high = float(np.mean(log_spec[high])) if np.any(high) else 0.0
+            hf_ratios.append(e_high / max(e_low, 1e-6))
+
+            max_bin = int(r_max)
+            r_int = np.clip(r_px.astype(np.int32), 0, max_bin)
+            r_sum = np.bincount(r_int.ravel(), weights=log_spec.ravel(), minlength=max_bin + 1)
+            r_cnt = np.bincount(r_int.ravel(), minlength=max_bin + 1)
+            prof = r_sum / np.maximum(r_cnt, 1)
+
+            start = max(2, int(self.inner_cutoff * max_bin))
+            end = max(start + 4, int(0.92 * max_bin))
+            tail = prof[start:end]
+            if tail.size >= 4:
+                freqs = np.log(np.arange(start, start + tail.size, dtype=np.float32))
+                slope_m, _ = np.polyfit(freqs, tail.astype(np.float32), 1)
+                slopes.append(float(-slope_m))
+            else:
+                slopes.append(1.2)
+
+        slope_diff = max(slopes) - min(slopes)
+        hf_diff = max(hf_ratios) / max(min(hf_ratios), 1e-3)
+        return float(slope_diff), float(hf_diff)
 
     def analyze(
         self,
@@ -219,21 +279,22 @@ class FFTAnalyzer:
                 / max(float(np.mean(tail_profile)), 1e-6)
             )
 
-        # 4. Calibrated FFT scoring (prevents natural real-video log1p ratios from false-alarming)
+        # 4. Quadrant / Sub-region spectral discrepancy
+        quad_slope_diff, quad_hf_ratio = self._analyze_quadrant_discrepancy(y_chan)
+
+        # 5. Calibrated FFT scoring
         spike_term = float(np.clip((top_spike_mean_z - 3.7) / 4.2, 0.0, 1.0))
         density_term = float(np.clip(spike_density / 0.004, 0.0, 1.0))
         spike_subscore = float(
             np.clip(0.60 * spike_term + 0.40 * density_term, 0.0, 1.0)
         )
 
-        # Small crops (< 100px radius) naturally have slightly higher 1D bin variance
         rough_base = 0.030 if max_bin < 100 else 0.018
         roughness_term = float(
             np.clip((radial_roughness - rough_base) / 0.038, 0.0, 1.0)
         )
         fit_term = float(np.clip((radial_fit_rmse - 0.036) / 0.055, 0.0, 1.0))
 
-        # Natural camera 1/f^alpha slopes lie around [0.75, 2.35]
         if spectral_slope < 0.75:
             slope_term = float(np.clip((0.75 - spectral_slope) / 0.60, 0.0, 1.0))
         elif spectral_slope > 2.35:
@@ -241,31 +302,35 @@ class FFTAnalyzer:
         else:
             slope_term = 0.0
 
-        # Real compressed videos often have log1p HF ratios ~0.75-0.89; flag only extreme >0.90
         hf_term = float(np.clip((hf_ratio - 0.90) / 0.12, 0.0, 1.0))
         chroma_hf_term = float(np.clip((chroma_hf_ratio - 0.83) / 0.14, 0.0, 1.0))
 
+        quad_slope_term = float(np.clip((quad_slope_diff - 0.55) / 0.75, 0.0, 1.0))
+        quad_hf_term = float(np.clip((quad_hf_ratio - 1.35) / 0.65, 0.0, 1.0))
+        quad_subscore = float(np.clip(0.55 * quad_slope_term + 0.45 * quad_hf_term, 0.0, 1.0))
+
         shape_subscore = float(
             np.clip(
-                0.32 * fit_term
-                + 0.28 * slope_term
-                + 0.20 * roughness_term
+                0.28 * fit_term
+                + 0.24 * slope_term
+                + 0.18 * roughness_term
                 + 0.10 * hf_term
-                + 0.10 * chroma_hf_term,
+                + 0.10 * chroma_hf_term
+                + 0.10 * quad_subscore,
                 0.0,
                 1.0,
             )
         )
 
-        dominant_signal = max(spike_subscore, shape_subscore)
-        avg_signal = 0.5 * (spike_subscore + shape_subscore)
+        dominant_signal = max(spike_subscore, shape_subscore, quad_subscore)
+        avg_signal = (spike_subscore + shape_subscore + quad_subscore) / 3.0
 
         fft_score = round(
             float(np.clip(0.65 * dominant_signal + 0.35 * avg_signal, 0.0, 1.0)),
             4,
         )
 
-        # 5. Export 2D-FFT spectrum image and 1D radial profile plot
+        # 6. Export 2D-FFT spectrum image and 1D radial profile plot
         spectrum_path: Optional[str] = None
         radial_plot_path: Optional[str] = None
 
@@ -340,6 +405,8 @@ class FFTAnalyzer:
                 "radial_roughness": round(radial_roughness, 5),
                 "radial_fit_rmse": round(radial_fit_rmse, 5),
                 "spectral_slope": round(spectral_slope, 4),
+                "quadrant_slope_discrepancy": round(quad_slope_diff, 4),
+                "quadrant_hf_discrepancy": round(quad_hf_ratio, 4),
             },
             "fft_spectrum_path": spectrum_path,
             "fft_radial_plot_path": radial_plot_path,

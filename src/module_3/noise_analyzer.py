@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -79,8 +79,9 @@ def _compute_content_mask(gray: np.ndarray, tol: float = 2.0) -> np.ndarray:
 
 class NoiseAnalyzer:
     """
-    Module 3.1: Calibrated SRM Noise Residual & Face-Boundary Blending Analysis.
-    Works natively on BOTH extracted video PNG frames and JPEG images.
+    Module 3.1: Calibrated SRM Noise Residual & Intra-Face Patch Consistency Analysis.
+    Detects both global face-vs-background noise contrast and localized intra-face
+    splicing patches (bi-modal noise distribution / inconsistent pixel grain).
     """
 
     def __init__(self, block_size: int = 16):
@@ -123,7 +124,7 @@ class NoiseAnalyzer:
         cb_res = np.abs(cv2.filter2D(cb_chan, cv2.CV_32F, SRM_KV_KERNEL))
         chroma_res = 0.5 * (cr_res + cb_res)
 
-        # 2. Block-level MEDIAN noise map (robust against sharp hair/text edges)
+        # 2. Block-level noise map across the whole image
         bs = min(self.block_size, h, w)
         bh = max(1, h // bs)
         bw = max(1, w // bs)
@@ -137,7 +138,6 @@ class NoiseAnalyzer:
             y_blocks[valid_blocks] if np.any(valid_blocks) else y_blocks.ravel()
         )
 
-        # Quantization-safe denominators prevent flat H.264 background walls from blowing up ratios
         p50 = float(np.percentile(active_block_vals, 50))
         p95 = float(np.percentile(active_block_vals, 95))
         noise_p95_p50_ratio = float(p95 / max(p50, 1.0))
@@ -145,7 +145,7 @@ class NoiseAnalyzer:
             np.std(active_block_vals) / max(float(np.mean(active_block_vals)), 0.90)
         )
 
-        # 3. Face-vs-Background Skin Noise & Face-Boundary Seam Analysis
+        # 3. Face vs. Background & Intra-Face Patch Noise Dispersion
         face_noise_median: Optional[float] = None
         bg_noise_median: Optional[float] = None
         face_bg_noise_contrast: Optional[float] = None
@@ -155,6 +155,11 @@ class NoiseAnalyzer:
         bg_chroma_noise: Optional[float] = None
         face_bg_chroma_contrast: Optional[float] = None
         max_boundary_seam_ratio: Optional[float] = None
+
+        # Intra-face metrics (detecting localized patches / splices inside the face)
+        intra_face_cv_vals: List[float] = []
+        intra_face_p90_p10_vals: List[float] = []
+        intra_face_outlier_vals: List[float] = []
 
         if face_bboxes:
             face_mask = np.zeros((h, w), dtype=bool)
@@ -171,7 +176,28 @@ class NoiseAnalyzer:
 
                 face_mask[y1:y2, x1:x2] = True
 
-                # Compare SRM noise median along face perimeter vs inner core & outer context
+                # Measure INTRA-FACE block noise dispersion
+                f_bs = max(8, min(16, bw_box // 4, bh_box // 4))
+                f_bh = bh_box // f_bs
+                f_bw = bw_box // f_bs
+                if f_bh >= 2 and f_bw >= 2:
+                    face_roi_y = y_res[y1 : y1 + f_bh * f_bs, x1 : x1 + f_bw * f_bs]
+                    face_blocks = np.median(
+                        face_roi_y.reshape(f_bh, f_bs, f_bw, f_bs), axis=(1, 3)
+                    ).ravel()
+                    fb_mean = float(np.mean(face_blocks))
+                    fb_std = float(np.std(face_blocks))
+                    fb_p10 = float(np.percentile(face_blocks, 10))
+                    fb_p90 = float(np.percentile(face_blocks, 90))
+
+                    intra_face_cv_vals.append(fb_std / max(fb_mean, 0.40))
+                    intra_face_p90_p10_vals.append(fb_p90 / max(fb_p10, 0.35))
+                    # Outlier patch ratio: blocks deviating > 2.0 std from face median
+                    fb_med = float(np.median(face_blocks))
+                    outliers = np.mean(np.abs(face_blocks - fb_med) > (2.0 * max(fb_std, 0.25)))
+                    intra_face_outlier_vals.append(float(outliers))
+
+                # Perimeter seam check
                 pad_x = max(4, int(round(0.16 * bw_box)))
                 pad_y = max(4, int(round(0.16 * bh_box)))
                 ox1, oy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
@@ -216,7 +242,6 @@ class NoiseAnalyzer:
             valid_bg = (~face_mask) & content_mask
 
             if np.any(valid_face) and np.any(valid_bg):
-                # 35th percentile inside face isolates smooth skin noise away from eyes/brows/lips
                 face_noise_median = float(np.percentile(y_res[valid_face], 35))
                 bg_noise_median = float(np.median(y_res[valid_bg]))
                 face_smoother_than_bg = face_noise_median < bg_noise_median
@@ -232,7 +257,7 @@ class NoiseAnalyzer:
                     / max(min(face_chroma_noise, bg_chroma_noise), 0.40)
                 )
 
-        # 4. Calibrated Noise & Boundary Suspicion Score [0.0, 1.0]
+        # 4. Calibrated Noise Suspicion Score [0.0, 1.0]
         inconsistency_term = float(
             1.0 - np.exp(-0.22 * max(noise_p95_p50_ratio - 4.5, 0.0))
         )
@@ -260,6 +285,26 @@ class NoiseAnalyzer:
             )
             subscores.append(seam_term)
 
+        # Intra-face patch terms (protecting against internal component splice grain)
+        max_intra_cv = float(max(intra_face_cv_vals)) if intra_face_cv_vals else 0.0
+        max_intra_p90 = float(max(intra_face_p90_p10_vals)) if intra_face_p90_p10_vals else 1.0
+        max_intra_outliers = float(max(intra_face_outlier_vals)) if intra_face_outlier_vals else 0.0
+
+        if intra_face_cv_vals:
+            intra_cv_term = float(np.clip((max_intra_cv - 0.65) / 0.85, 0.0, 1.0))
+            intra_p90_term = float(np.clip((max_intra_p90 - 2.40) / 2.60, 0.0, 1.0))
+            intra_outlier_term = float(np.clip((max_intra_outliers - 0.08) / 0.22, 0.0, 1.0))
+            intra_face_subscore = float(
+                np.clip(
+                    0.45 * max(intra_cv_term, intra_p90_term)
+                    + 0.35 * intra_p90_term
+                    + 0.20 * intra_outlier_term,
+                    0.0,
+                    1.0,
+                )
+            )
+            subscores.append(intra_face_subscore)
+
         noise_score = round(
             float(
                 np.clip(
@@ -271,7 +316,7 @@ class NoiseAnalyzer:
             4,
         )
 
-        # 5. Export XAI Visuals (SRM Residual Map + Smooth Block Variance Heatmap)
+        # 5. Export XAI Visuals
         residual_path: Optional[str] = None
         heatmap_path: Optional[str] = None
 
@@ -339,6 +384,9 @@ class NoiseAnalyzer:
                 "boundary_seam_ratio": round(max_boundary_seam_ratio, 4)
                 if max_boundary_seam_ratio is not None
                 else None,
+                "intra_face_noise_cv": round(max_intra_cv, 4) if intra_face_cv_vals else None,
+                "intra_face_p90_p10_ratio": round(max_intra_p90, 4) if intra_face_cv_vals else None,
+                "intra_face_outlier_ratio": round(max_intra_outliers, 4) if intra_face_cv_vals else None,
             },
             "noise_residual_path": residual_path,
             "noise_heatmap_path": heatmap_path,
