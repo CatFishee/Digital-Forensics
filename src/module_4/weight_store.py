@@ -48,6 +48,13 @@ MODEL_REGISTRY: Dict[str, ModelWeightSpec] = {
         license_tag="CC-BY-NC-4.0",
         source_note="DeepfakeBench F3Net (FAD branch, FaceForensics++ c23)",
     ),
+    "commfor": ModelWeightSpec(
+        model_id="commfor",
+        filename="config.json",
+        hf_repo_id="buildborderless/CommunityForensics-DeepfakeDet-ViT",
+        license_tag="Apache-2.0 / Research",
+        source_note="Community Forensics ViT-S/16 (CVPR 2025, 384x384 whole-frame AI detector)",
+    ),
 }
 
 

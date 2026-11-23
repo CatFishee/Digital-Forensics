@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import numpy as np
 
 from .base import BaseModule4Detector, compute_suspicion_level, resolve_torch_device
+from .community_vit import CommunityForensicsDetector
 from .forensic_translator import Module4ForensicTranslator
 
 # Active Module 4 detectors.
-# F3NetDetector remains in `src/module_4/f3net_detector.py` (like ELA in Module 3)
-# and is intentionally omitted from the active registry until re-enabled.
-DETECTOR_REGISTRY: Dict[str, Type[BaseModule4Detector]] = {}
+DETECTOR_REGISTRY: Dict[str, Type[BaseModule4Detector]] = {
+    CommunityForensicsDetector.detector_id: CommunityForensicsDetector,
+}
 
 
 def register_detector(detector_cls: Type[BaseModule4Detector]) -> None:
@@ -72,30 +74,35 @@ def _get_manifest_dir(m2_manifest: Dict[str, Any]) -> Path:
     return Path(artifacts_dir.get("root", Path("data/processed") / case_id))
 
 
-def run_module4(
-    m2_manifest: Dict[str, Any],
-    detector_ids: Optional[Sequence[str]] = None,
-    device: str = "auto",
-    auto_download: bool = True,
-    batch_size: int = 4,
-    enable_gradcam: bool = True,
+def _build_detector_summary(
+    cls: Type[BaseModule4Detector], res: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Execute Module 4 detectors using Sequential Lazy-Loading:
-      Loads one detector -> evaluates pre-cropped inputs from Module 2 ->
-      saves XAI overlays -> unloads model and frees RAM/VRAM before loading the next.
-    """
-    manifest_dir = _get_manifest_dir(m2_manifest)
-    m4_root = manifest_dir / "module4"
-    m4_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "detector_id": res["detector_id"],
+        "display_name": res["display_name"],
+        "paradigm": res["paradigm"],
+        "input_size": res["input_size"],
+        "crop_spec": cls.get_crop_spec(),
+        "weights_path": res["weights_path"],
+        "device_used": res["device_used"],
+        **res["summary"],
+    }
 
-    target_ids = (
-        list(detector_ids)
-        if detector_ids is not None
-        else list(DETECTOR_REGISTRY.keys())
-    )
-    resolved_device = str(resolve_torch_device(device))
 
+def _run_sequential(
+    target_ids: List[str],
+    m2_manifest: Dict[str, Any],
+    m4_root: Path,
+    resolved_device: str,
+    auto_download: bool,
+    batch_size: int,
+    enable_gradcam: bool,
+) -> Tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+    List[str],
+    List[Dict[str, str]],
+]:
     detector_outputs: Dict[str, Dict[str, Any]] = {}
     detector_summaries: Dict[str, Dict[str, Any]] = {}
     detectors_executed: List[str] = []
@@ -120,23 +127,164 @@ def run_module4(
                 enable_gradcam=enable_gradcam,
             )
             detector_outputs[det_id] = res
-            detector_summaries[det_id] = {
-                "detector_id": res["detector_id"],
-                "display_name": res["display_name"],
-                "paradigm": res["paradigm"],
-                "input_size": res["input_size"],
-                "crop_spec": cls.get_crop_spec(),
-                "weights_path": res["weights_path"],
-                "device_used": res["device_used"],
-                **res["summary"],
-            }
+            detector_summaries[det_id] = _build_detector_summary(cls, res)
             detectors_executed.append(det_id)
         except Exception as exc:
             detectors_skipped.append({"detector_id": det_id, "reason": str(exc)})
         finally:
             detector.unload()
 
-    # Build frame_index lookup maps to avoid positional indexing assumptions
+    return detector_outputs, detector_summaries, detectors_executed, detectors_skipped
+
+
+def _run_parallel(
+    target_ids: List[str],
+    m2_manifest: Dict[str, Any],
+    m4_root: Path,
+    resolved_device: str,
+    auto_download: bool,
+    batch_size: int,
+    enable_gradcam: bool,
+) -> Tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+    List[str],
+    List[Dict[str, str]],
+]:
+    """
+    Parallel Execution Mode (for high-VRAM GPUs):
+      1. Safely pre-load all selected detectors into VRAM/RAM.
+      2. Run `analyze_case` concurrently across threads (sharing 1 CUDA context).
+      3. Unload all models in finally block.
+    """
+    detector_outputs: Dict[str, Dict[str, Any]] = {}
+    detector_summaries: Dict[str, Dict[str, Any]] = {}
+    detectors_executed: List[str] = []
+    detectors_skipped: List[Dict[str, str]] = []
+
+    loaded_items: List[Tuple[str, Type[BaseModule4Detector], BaseModule4Detector]] = []
+    try:
+        # 1. Pre-load an toàn (tránh xung đột cache/download khi nhiều thread cùng tải)
+        for det_id in target_ids:
+            cls = DETECTOR_REGISTRY.get(det_id)
+            if cls is None:
+                detectors_skipped.append(
+                    {"detector_id": det_id, "reason": "Not registered in DETECTOR_REGISTRY"}
+                )
+                continue
+
+            detector = cls()
+            try:
+                detector.load(device=resolved_device, auto_download=auto_download)
+                loaded_items.append((det_id, cls, detector))
+            except Exception as exc:
+                detector.unload()
+                detectors_skipped.append({"detector_id": det_id, "reason": str(exc)})
+
+        # 2. Chạy suy luận & Grad-CAM song song
+        if loaded_items:
+            def _worker(
+                item: Tuple[str, Type[BaseModule4Detector], BaseModule4Detector]
+            ) -> Tuple[str, Type[BaseModule4Detector], Dict[str, Any]]:
+                d_id, d_cls, d_inst = item
+                res = d_inst.analyze_case(
+                    m2_manifest=m2_manifest,
+                    output_dir=str(m4_root / d_id),
+                    batch_size=batch_size,
+                    enable_gradcam=enable_gradcam,
+                )
+                return d_id, d_cls, res
+
+            temp_results: Dict[str, Tuple[Type[BaseModule4Detector], Dict[str, Any]]] = {}
+            with ThreadPoolExecutor(max_workers=len(loaded_items)) as executor:
+                future_map = {
+                    executor.submit(_worker, item): item[0] for item in loaded_items
+                }
+                for fut in as_completed(future_map):
+                    d_id = future_map[fut]
+                    try:
+                        res_id, res_cls, res_data = fut.result()
+                        temp_results[res_id] = (res_cls, res_data)
+                    except Exception as exc:
+                        detectors_skipped.append({"detector_id": d_id, "reason": str(exc)})
+
+            # Giữ đúng thứ tự ưu tiên như target_ids
+            for det_id in target_ids:
+                if det_id in temp_results:
+                    d_cls, d_res = temp_results[det_id]
+                    detector_outputs[det_id] = d_res
+                    detector_summaries[det_id] = _build_detector_summary(d_cls, d_res)
+                    detectors_executed.append(det_id)
+    finally:
+        for _, _, detector in loaded_items:
+            try:
+                detector.unload()
+            except Exception:
+                pass
+
+    return detector_outputs, detector_summaries, detectors_executed, detectors_skipped
+
+
+def run_module4(
+    m2_manifest: Dict[str, Any],
+    detector_ids: Optional[Sequence[str]] = None,
+    device: str = "auto",
+    auto_download: bool = True,
+    batch_size: int = 4,
+    enable_gradcam: bool = True,
+    execution_mode: str = "sequential",  # "sequential" | "parallel"
+) -> Dict[str, Any]:
+    """
+    Execute Module 4 detectors using either:
+      - "sequential": Sequential Lazy-Loading (low RAM / 8GB machines).
+      - "parallel": Concurrent GPU/Multi-thread execution (high-VRAM GPUs).
+    """
+    manifest_dir = _get_manifest_dir(m2_manifest)
+    m4_root = manifest_dir / "module4"
+    m4_root.mkdir(parents=True, exist_ok=True)
+
+    target_ids = (
+        list(detector_ids)
+        if detector_ids is not None
+        else list(DETECTOR_REGISTRY.keys())
+    )
+    resolved_device = str(resolve_torch_device(device))
+    mode_norm = "parallel" if str(execution_mode).lower() == "parallel" else "sequential"
+
+    if mode_norm == "parallel" and len(target_ids) > 1:
+        (
+            detector_outputs,
+            detector_summaries,
+            detectors_executed,
+            detectors_skipped,
+        ) = _run_parallel(
+            target_ids=target_ids,
+            m2_manifest=m2_manifest,
+            m4_root=m4_root,
+            resolved_device=resolved_device,
+            auto_download=auto_download,
+            batch_size=batch_size,
+            enable_gradcam=enable_gradcam,
+        )
+        mode_display = "Parallel Concurrent (Pre-loaded)"
+    else:
+        (
+            detector_outputs,
+            detector_summaries,
+            detectors_executed,
+            detectors_skipped,
+        ) = _run_sequential(
+            target_ids=target_ids,
+            m2_manifest=m2_manifest,
+            m4_root=m4_root,
+            resolved_device=resolved_device,
+            auto_download=auto_download,
+            batch_size=batch_size,
+            enable_gradcam=enable_gradcam,
+        )
+        mode_display = "Sequential Lazy-Loading"
+
+    # Build frame_index lookup maps
     det_frame_lookup: Dict[str, Dict[int, Dict[str, Any]]] = {}
     for det_id in detectors_executed:
         by_idx: Dict[int, Dict[str, Any]] = {}
@@ -222,10 +370,8 @@ def run_module4(
         max_m4 = 0.0
         topk_m4 = 0.0
 
-    # Video-level aggregation uses mean probability across evaluated frames to avoid
-    # single-frame blur/occlusion outliers triggering false HIGH alerts.
     is_multi_frame = len(combined_frames) > 1
-    primary_case_score = mean_m4 if is_multi_frame else max_m4
+    primary_case_score = topk_m4 if is_multi_frame else max_m4
 
     m4_manifest_path = manifest_dir / "module4_manifest.json"
     m4_manifest: Dict[str, Any] = {
@@ -235,7 +381,7 @@ def run_module4(
             "media_type": m2_manifest["forensics_metadata"]["media_type"],
         },
         "module4_settings": {
-            "execution_mode": "Sequential Lazy-Loading",
+            "execution_mode": mode_display,
             "device_target": resolved_device,
             "gradcam_enabled": bool(enable_gradcam),
             "batch_size": int(batch_size),
