@@ -1410,8 +1410,10 @@ if "applied_settings" not in st.session_state:
         "output_size": FIXED_ALIGNED_FACE_SIZE,
         "max_frames": 10,
         "enable_module4": True,
+        "m4_selected_detectors": [d["detector_id"] for d in list_available_detectors()],
         "m4_auto_download": True,
         "m4_gradcam": True,
+        "m4_execution_mode": "sequential",
     }
 
 st.title("🔍 Digital Media & Deepfake Check")
@@ -1478,8 +1480,96 @@ sel_m4_gradcam = st.sidebar.checkbox(
     value=bool(current_cfg.get("m4_gradcam", True)),
     disabled=is_locked or not sel_m4_enabled,
 )
-hw_label = "GPU (CUDA)" if torch.cuda.is_available() else "CPU (Sequential Lazy-Load)"
-st.sidebar.caption(f"Compute Mode: `{hw_label}`")
+available_m4 = list_available_detectors()
+avail_m4_map = {d["detector_id"]: d for d in available_m4}
+avail_m4_ids = list(avail_m4_map.keys())
+
+M4_MODEL_CATALOG = [
+    (
+        "gend",
+        "1. Deepfake / Face Manipulation (GenD)",
+        "Phát hiện chỉnh sửa khuôn mặt tổng quát & partial deepfake (CLIP ViT-L/14).",
+    ),
+    (
+        "sbi",
+        "2. Face-Swap Blending (SBI)",
+        "Phát hiện đường viền ghép mặt (face-swap seams) bằng EfficientNet-B4.",
+    ),
+    (
+        "commfor",
+        "3. AI-Generated / Synthetic (CommFor)",
+        "Phát hiện ảnh/video sinh hoàn toàn bằng AI (Community Forensics ViT-S/16).",
+    ),
+    (
+        "audio_spoof",
+        "4. Audio & Lip-Sync (Wav2Vec2)",
+        "Kiểm tra giọng nói giả mạo & độ khớp khẩu hình miệng với âm thanh.",
+    ),
+]
+
+saved_m4_sel = current_cfg.get("m4_selected_detectors")
+if saved_m4_sel is None:
+    saved_m4_sel = avail_m4_ids
+
+st.sidebar.markdown("**Active Module 4 Models**")
+sel_m4_detectors: list[str] = []
+catalog_ids = {cid for cid, _, _ in M4_MODEL_CATALOG}
+
+for det_id, ui_label, ui_help in M4_MODEL_CATALOG:
+    is_registered = det_id in avail_m4_map
+    if is_registered:
+        checked = st.sidebar.toggle(
+            ui_label,
+            value=(det_id in saved_m4_sel),
+            key=f"m4_toggle_{det_id}",
+            disabled=is_locked or not sel_m4_enabled,
+            help=ui_help,
+        )
+        if checked:
+            sel_m4_detectors.append(det_id)
+    else:
+        st.sidebar.toggle(
+            f"{ui_label} *(Pending)*",
+            value=False,
+            key=f"m4_toggle_{det_id}",
+            disabled=True,
+            help=f"{ui_help} (Chưa được đăng ký trong DETECTOR_REGISTRY).",
+        )
+
+# Tự động hiển thị thêm nếu sau này nhóm đăng ký model mới ngoài 4 model trên
+for extra_id, extra_meta in avail_m4_map.items():
+    if extra_id not in catalog_ids:
+        checked = st.sidebar.toggle(
+            extra_meta.get("display_name", extra_id.upper()),
+            value=(extra_id in saved_m4_sel),
+            key=f"m4_toggle_{extra_id}",
+            disabled=is_locked or not sel_m4_enabled,
+        )
+        if checked:
+            sel_m4_detectors.append(extra_id)
+    
+cur_m4_mode = current_cfg.get("m4_execution_mode", "sequential")
+sel_m4_mode = st.sidebar.radio(
+    "Model Loading Mode",
+    options=["sequential", "parallel"],
+    index=0 if cur_m4_mode == "sequential" else 1,
+    format_func=lambda m: (
+        "Sequential Lazy-Load (8GB RAM / CPU)"
+        if m == "sequential"
+        else "Parallel Concurrent (High-End GPU)"
+    ),
+    disabled=is_locked or not sel_m4_enabled,
+    help=(
+        "Sequential loads and unloads 1 model at a time. "
+        "Parallel keeps selected models loaded and runs them concurrently (requires high VRAM/RAM)."
+    ),
+)
+if sel_m4_mode == "parallel" and not torch.cuda.is_available():
+    st.sidebar.caption("⚠️ No CUDA GPU detected — Parallel mode may use heavy RAM on CPU.")
+
+hw_base = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+mode_badge = "Parallel" if sel_m4_mode == "parallel" else "Sequential Lazy-Load"
+st.sidebar.caption(f"Compute Mode: `{hw_base} • {mode_badge}`")
 
 st.sidebar.markdown("---")
 if not is_locked:
@@ -1492,8 +1582,10 @@ if not is_locked:
             "output_size": FIXED_ALIGNED_FACE_SIZE,
             "max_frames": sel_max_frames,
             "enable_module4": sel_m4_enabled,
+            "m4_selected_detectors": sel_m4_detectors,
             "m4_auto_download": sel_m4_auto_download,
             "m4_gradcam": sel_m4_gradcam,
+            "m4_execution_mode": sel_m4_mode,
         }
         st.session_state["settings_locked"] = True
         st.session_state.pop("m2_cache_key", None)
@@ -1596,10 +1688,17 @@ if uploaded_file is not None:
         )
     else:
         active_cfg = st.session_state["applied_settings"]
+        avail_ids_now = [d["detector_id"] for d in list_available_detectors()]
+        selected_m4_ids = active_cfg.get("m4_selected_detectors")
+        if selected_m4_ids is None:
+            selected_m4_ids = avail_ids_now
+
         crop_specs = (
-            get_required_crop_specs() if active_cfg.get("enable_module4", True) else []
+            get_required_crop_specs(selected_m4_ids)
+            if active_cfg.get("enable_module4", True) and selected_m4_ids
+            else []
         )
-        registered_ids = ",".join(d["detector_id"] for d in list_available_detectors())
+        registered_ids = ",".join(selected_m4_ids)
         crop_sig = hashlib.md5(
             json.dumps(crop_specs, sort_keys=True).encode("utf-8")
         ).hexdigest()[:6]
@@ -1607,7 +1706,7 @@ if uploaded_file is not None:
             f"{file_sha[:8]}_{active_cfg['detector_backend']}_{active_cfg['min_confidence']:.2f}_"
             f"{FIXED_ALIGNED_FACE_SIZE}_{active_cfg['max_frames']}_m2v2_{crop_sig}_m3v8_"
             f"m4_{int(active_cfg['enable_module4'])}_{int(active_cfg['m4_auto_download'])}_"
-            f"{int(active_cfg['m4_gradcam'])}_{registered_ids}"
+            f"{int(active_cfg['m4_gradcam'])}_{registered_ids}_{active_cfg.get('m4_execution_mode', 'sequential')}"
         )
 
         if st.session_state.get("m2_cache_key") != cache_key:
@@ -1633,14 +1732,16 @@ if uploaded_file is not None:
 
                     m4_res = None
                     m4_err = None
-                    if active_cfg.get("enable_module4", True):
+                    if active_cfg.get("enable_module4", True) and selected_m4_ids:
                         try:
                             m4_res = run_module4(
                                 m2_manifest=m2_res,
+                                detector_ids=selected_m4_ids,
                                 device="auto",
                                 auto_download=bool(active_cfg.get("m4_auto_download", True)),
                                 batch_size=4,
                                 enable_gradcam=bool(active_cfg.get("m4_gradcam", True)),
+                                execution_mode=str(active_cfg.get("m4_execution_mode", "sequential")),
                             )
                         except Exception as exc_m4:
                             m4_err = str(exc_m4)
